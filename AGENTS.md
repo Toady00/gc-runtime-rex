@@ -64,13 +64,16 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
 - Use `block.event` with `type=paste` for paste semantics, and `send-key
   enter` to submit. Rev 18 preserved 102,414 UTF-8 bytes, including an
   embedded newline, across five independently bracketed paste events in a
-  raw tty. Do not infer application acceptance from an RPC acknowledgement.
+  raw tty. `rex send` to that kind of receiver sent LF as LF with no paste
+  markers. It accepted 60,000 bytes and refused 65,536 without typing them.
+  Do not infer application acceptance from an RPC acknowledgement.
 - `rex capture` always returns the whole scrollback. There is no tail option,
   and its cost grows with scrollback size.
 - The app auto-subscribes to newly created sessions. A new background tab
   reported `size.owner: null` and `size.desired: []` even with an `app`
   client in `session.list_clients`. Do not use the session client list by
-  itself as a viewing signal.
+  itself as a viewing signal. A `rex new` terminal had no owner after the
+  CLI exited on rev 18; the stale CLI owner seen on rev 11 did not recur.
 - `rex do` needs `-s <id>` for block methods. Its Lua bridge drops JSON
   nulls when round-tripping replies, including `process.last_exit: null`.
   Use direct JSON calls for process/status reads that need this distinction.
