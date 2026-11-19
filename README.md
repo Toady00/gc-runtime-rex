@@ -59,7 +59,7 @@ nudge.
 Set `ready_prompt_prefix` for programs with a recognizable composer, or
 `ready_delay_ms` for programs without one. A prefix takes priority over a
 delay and must remain visible across observations at least 400 ms apart.
-Without either hint, Rex waits for attributed OSC `idle` or for the tty
+Without either hint, the pack waits for attributed OSC `idle` or for the tty
 to stay noncanonical with bracketed paste enabled across observations at
 least 400 ms apart. OSC `working` does not override that tty evidence;
 `blocked` always vetoes a nudge.
