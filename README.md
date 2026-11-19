@@ -58,19 +58,30 @@ nudge.
 
 Set `ready_prompt_prefix` for programs with a recognizable composer, or
 `ready_delay_ms` for programs without one. A prefix takes priority over a
-delay. Without either, Rex waits for attributed OSC `idle` or for the tty
-to stay noncanonical with bracketed paste enabled for at least 400 ms.
+delay and must remain visible across observations at least 400 ms apart.
+Without either hint, Rex waits for attributed OSC `idle` or for the tty
+to stay noncanonical with bracketed paste enabled across observations at
+least 400 ms apart. OSC `working` does not override that tty evidence;
+`blocked` always vetoes a nudge.
 For a plain screen with no readiness signal, startup waits at most 15 s
 unless you configured a delay. A delay has at most 60 s of probe time.
 Gas City's deadline can shorten either wait.
 
 If a dialog or menu is visible, or readiness cannot be confirmed, the tab
-stays open and the first turn is withheld. The runtime warns and puts the
-reason in `GC_STARTUP_DELIVERY_UNCONFIRMED`. Gas City can run its normal
-post-start dialog dismissal after the op returns. The tested version does
-not consume this metadata or replay that text. Check the composer and
-resend manually if needed. Startup fails and rolls back the block if the
-program exits before a required first turn can be delivered.
+stays open and the first turn is withheld. Gas City can run its normal
+post-start dialog dismissal after the op returns. The tested version drops
+successful-operation stderr and does not replay that text. If a new session
+appears idle with no first turn, inspect its composer and read the pack's
+stored reason using the controller's socket and state-root settings:
+
+```sh
+GC_EXEC_CITY_PATH=/absolute/path/to/city \
+  /absolute/path/to/gc-runtime-rex/assets/gc-runtime-rex \
+  get-meta 'EXACT_SESSION_NAME' GC_STARTUP_DELIVERY_UNCONFIRMED
+```
+
+Resend only after checking the composer. Startup fails and rolls back
+the block if the program exits before a required first turn can be sent.
 
 ## Server and state
 
@@ -124,15 +135,19 @@ city sessions in Rex if you reach its session limit. The pack will not
 destroy a session wholesale: another client could add a tab between the
 empty check and the destroy request. If Rex loses a window-create reply,
 the pack releases the name and can reclaim the block on the next start or
-stop if the launcher supplies a receipt. Without an ID it cannot identify
-the leftover window. No launch config can be recovered from an abandoned
-pipe.
+stop if the launcher supplies a receipt. Receipt-less records expire after
+eight seconds and are removed by the next start or stop. Without an ID the
+pack cannot identify a leftover window. No launch config can be recovered
+from an abandoned pipe. Lifecycle locks are per exact name and are retained
+in the state root so a waiter cannot acquire a different inode.
 
 After a server restart, the pack will not drive a restored block with a
 new server instance or a replacement child PID. It creates a fresh block
-instead. Inspect and remove any restored tabs you no longer need. If you
-tested a pre-release version keyed by hostname, stop its sessions with
-that version before switching to this one.
+in a fresh city session instead. Rex restores saved sessions by default,
+but a restored layout does not prove that its programs or every tab belong
+to the pack. You may see two sessions labelled `GC <city>`; inspect the old
+one before removing its tabs. If you tested a pre-release version keyed by
+hostname, stop its sessions with that version before switching to this one.
 
 ## Limits
 
@@ -140,13 +155,19 @@ that version before switching to this one.
   pasting and again after a 500 ms pause before Enter. An explicit
   `send-keys` or `interrupt` bypasses the dialog guard. The check and send
   are separate calls, and no screen matcher recognizes every dialog.
+- A numbered menu needs a selected cursor row and an adjacent option.
+  Numbered transcript lines, quoted phrases, and a lone `Esc to cancel`
+  footer do not block delivery. Known dialogs use specific headings or
+  multiple cues near the bottom of the capture.
 - Large text is sent in
   UTF-8 chunks; with bracketed paste the program receives a paste group per
   chunk. Multiline or tabbed text requires bracketed paste. Canonical tty
   input is rejected for large messages rather than risking truncation.
   Literal ESC and other terminal controls are rejected. A definite first
-  paste rejection can be retried. After an ambiguous or partial paste,
-  inspect the composer and use `interrupt` or restart before retrying.
+  paste rejection can be retried. If a dialog stops a paste before Enter,
+  a later nudge can proceed once a recognized composer is visibly empty.
+  An unknown submit result, a visible draft, or a composer whose contents
+  cannot be established still requires inspection and `interrupt` or restart.
 - Rex acknowledges that it queued input, not that the program read it. This
   carrier has no fenced input or typed `input-outcome` support. Gas City
   refuses fenced requests. Open the tab in Rex for interactive access;

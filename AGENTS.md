@@ -34,11 +34,13 @@ and say how it was verified.
 - Under `carrier.ops`, gc's `finishStart` dismisses dialogs only after
   `start` returns. On dialog or readiness timeout, leave the block running
   and record `GC_STARTUP_DELIVERY_UNCONFIRMED`. At `1e27045d0` gc neither
-  consumes that key nor retries the withheld text. A footer, NBSP, or box
-  border does not invalidate a prompt; a numbered menu cursor does.
-- The exec wire has no argv prompt field. At `1e27045d0` prompt delivery
-  routes a named pack runtime's `arg` and `flag` prompts into its nudge
-  anyway. Direct `exec:` does not get the named-pack rule.
+  consumes that key nor retries the withheld text, and discards stderr on
+  success. The doctor scans tmux's internal diagnostic files, not an RPP
+  diagnostic path; use `get-meta` for this pack.
+- The exec wire has no argv prompt field. The exec contract doc says `arg`
+  and `flag` prompts are dropped, but `cmd/gc/prompt_delivery.go` at
+  `1e27045d0` routes them into a named pack runtime's nudge. Direct `exec:`
+  does not get the named-pack rule.
 - gc stores the ready prompt with `set-meta <name> GC_READY_PROMPT_PREFIX` and
   reads it back with `get-meta`. It must round-trip byte for byte, and `stop`
   must drop it.
@@ -81,6 +83,10 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   raw tty. `rex send` to that kind of receiver sent LF as LF with no paste
   markers. It accepted 60,000 bytes and refused 65,536 without typing them.
   Do not infer application acceptance from an RPC acknowledgement.
+- Use the newest prompt, tolerating NBSP, a box border, and a footer. A
+  numbered row needs a cursor and a neighbouring option to be a menu.
+  Auto-recover only a paste stopped by a dialog before Enter, and only
+  after a recognized composer is empty. An uncertain Enter is different.
 - `rex capture` always returns the whole scrollback. There is no tail option,
   and its cost grows with scrollback size.
 - The app auto-subscribes to newly created sessions. A new background tab
@@ -89,8 +95,10 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   itself as a viewing signal. A `rex new` terminal had no owner after the
   CLI exited on rev 18; the stale CLI owner seen on rev 11 did not recur.
 - `rex do` needs `-s <id>` for block methods. Its Lua bridge drops JSON
-  nulls when round-tripping replies, including `process.last_exit: null`.
-  Use direct JSON calls for process/status reads that need this distinction.
+  nulls and turns empty arrays into objects. The batched read uses an
+  explicit sentinel for `last_exit: null` after validating the child PID;
+  normalize empty status/size arrays at the boundary. Do not cache the
+  server instance across invocations.
 - OSC root records have no run id or exited flag. An immediate `exec`
   preserved a root with the same PID and the old name `bash` while
   `process` named `sleep`. Distinguish the initial shell hand-off from an
@@ -101,9 +109,10 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   never wait behind startup, paste debounce, or a capture.
 - Labels are not unique. Address blocks by full id; a label can be ambiguous.
 - Direct block calls on a missing block exit 3; socket failure is an
-  outage. `block.close` removed the test child that ignored SIGHUP. An
-  empty session remained with `server.status.exit_empty = false`, but a
-  stored session ID can vanish, even between probing and creating a tab.
+  outage. `block.close` removed the test child that ignored SIGHUP. Empty
+  sessions have persisted and disappeared in different observations; do
+  not assume either. `exit_empty` controls server shutdown once its last
+  session and connection close. It does not control empty session retention.
   The API has no atomic destroy-if-empty guard: close exact blocks only.
 - Verify both `server.status.instance_id` and the live block's child PID;
   a restored layout can retain IDs while the program changes. The
@@ -112,7 +121,8 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   rejection or a lost reply. Use the structured rejection code, never
   print the raw response. A pending create is absent to readers. Unlink
   its pipe before releasing the name and use a late receipt to reap only
-  that block. Never adopt or delete by label.
+  that block. Expire receipt-less records after the launch pipe wait and
+  CLI timeout. Never adopt or delete by label.
 
 ## Host work and startup
 
