@@ -1,0 +1,9 @@
+[pack]
+name = "gc-runtime-rex"
+version = "0.1.0"
+schema = 2
+
+[runtimes.rex]
+command = "assets/gc-runtime-rex"
+protocol = 0
+prompt_delivery = "nudge-fallback"
