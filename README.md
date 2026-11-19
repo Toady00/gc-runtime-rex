@@ -178,9 +178,12 @@ hostname, stop its sessions with that version before switching to this one.
   the pack has no CLI `attach` op.
 - Attachment uses the owner and size requests of the specific block. The
   app's subscriptions to every session are not treated as viewing every tab.
-  Ownership and size requests can linger; Rex has no per-block API that
-  proves what is currently visible. An indeterminate read keeps the session
-  awake. Check attachment on your client before enabling interactive sleep.
+  Rex has no API for what a client is showing. A block's owner is a size
+  claim, and the Mac app keeps its claim after you switch to another
+  session. So a session reads as attached from the first time the app opens
+  its tab, for as long as the app stays connected, and Gas City will not put
+  it to sleep. A session whose tab was never opened reads as detached. An
+  indeterminate read also keeps the session awake.
 - Rex exposes timestamps for OSC reports but no last-output timestamp.
   Other activity is sampled at most once every 2 seconds and dated when
   the capture changes. Rex sends all scrollback on capture, even for a
