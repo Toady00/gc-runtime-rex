@@ -9,8 +9,20 @@ case "$1" in
     start|stop|is-running|nudge|peek|send-keys|interrupt|clear-scrollback|set-meta|get-meta|remove-meta|get-last-activity|is-attached|program-status|process-alive|list-running|copy-to) ;;
     *) exit 2 ;;
 esac
-case "$0" in
-    */*) base=${0%/*} ;;
-    *) base=. ;;
-esac
-exec /usr/bin/env python3 -E -s -S -B "$base/run_rex.py" "$@"
+python=$(command -v python3) || {
+    printf '%s\n' 'Rex runtime: Python 3.9 or later is required on PATH' >&2
+    exit 1
+}
+exec "$python" -I -S -B -c '
+import pathlib, sys
+if sys.version_info < (3, 9):
+    sys.exit("Rex runtime: Python 3.9 or later is required on PATH")
+try:
+    assets = pathlib.Path(sys.argv.pop(1)).resolve(strict=True).parent
+    sys.path.insert(0, str(assets))
+    from gc_rex.runtime import main
+except (ImportError, OSError, RuntimeError):
+    sys.exit("Rex runtime: cannot load the installed runtime package")
+sys.argv[0] = str(assets / "gc-runtime-rex")
+sys.exit(main())
+' "$0" "$@"

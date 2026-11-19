@@ -6,8 +6,13 @@ from pathlib import Path
 import re
 import stat
 import sys
+import uuid
 
-from .support import Absent, Failure
+from .support import Absent, Failure, Unconfirmed
+
+
+class Rejected(Failure):
+    """Rex rejected the operation before applying it."""
 
 
 def object_id(value, kind):
@@ -39,24 +44,28 @@ class Rex:
 
     def cli(self, *args, data=None, creating=False):
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
-            raise Failure("Rex executable missing or not executable; set GC_REX_BIN")
+            raise Rejected("Rex executable missing or not executable; set GC_REX_BIN")
         try:
             st = self.socket.stat()
         except FileNotFoundError:
-            raise Failure("local Rex server socket is unavailable") from None
+            raise Rejected("local Rex server socket is unavailable") from None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid():
-            raise Failure("Rex socket must be a Unix socket owned by the runtime user")
-        code, output = self.budget.run(
-            [str(self.binary), "--autostart=false", *args], data=data,
-            creating=creating, env=self.env,
+            raise Rejected("Rex socket must be a Unix socket owned by the runtime user")
+        code, output, error = self.budget.run(
+            [str(self.binary), "--autostart=false", "--timeout=2s", *args], data=data,
+            creating=creating, env=self.env, limit=3, capture_error=True,
         )
         if code == 3:
             raise Absent()
         if code == 4:
-            raise Failure("local Rex server is unavailable (CLI exit 4)")
+            raise Rejected("local Rex server is unavailable (CLI exit 4)")
         if code != 0:
             # Rex errors can echo request text. Do not copy them into gc logs.
-            raise Failure(f"Rex {args[0]} failed (CLI exit {code})")
+            # Only explicit server rejection (or CLI usage failure) proves
+            # that the request did not run. EOF and lost responses do not.
+            rejected = code == 2 or re.search(rb"status=4\d\d code=[a-z_]+", error or b"")
+            failure = Rejected if rejected else Unconfirmed
+            raise failure(f"Rex {args[2] if args[:2] == ('api', 'call') else args[0]} failed (CLI exit {code})")
         return output
 
     def api(self, rpc, *, creating=False, **params):
@@ -66,6 +75,9 @@ class Rex:
     def process(self, target):
         return self.method(target, "process")
 
+    def instance(self):
+        return str(uuid.UUID(self.api("server.status")["instance_id"]))
+
     def method(self, target, method, **args):
         return self.api("block.method", **target, method=method, args=args)
 
@@ -73,7 +85,10 @@ class Rex:
         return self.cli("capture", "-s", target["session_id"], "-b", target["block_id"])
 
     def keys(self, target, keys):
-        self.cli("send-key", "-s", target["session_id"], "-b", target["block_id"], "--", *keys)
+        from .terminal import key_payload
+
+        for key in keys:
+            self.api("block.event", **target, event={"type": "key", "payload": key_payload(key)})
 
     def paste(self, target, text):
         self.api("block.event", **target, event={"type": "paste", "payload": {"text": text}})

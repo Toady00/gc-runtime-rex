@@ -74,7 +74,8 @@ def setup(cfg, work, name, budget):
     env = overlay(os.environ, dict(cfg["env"], GC_SESSION=name))
     commands = [["/bin/sh", "-c", command] for command in cfg.get("session_setup", [])]
     if cfg.get("session_setup_script"):
-        commands.append(["/bin/sh", cfg["session_setup_script"]])
+        script = Path(cfg["session_setup_script"])
+        commands.append([str(work / script) if not script.is_absolute() else str(script)])
     for argv in commands:
         try:
             code, _ = budget.run(argv, cwd=work, env=env, limit=min(10, budget.remaining(0.25)))
