@@ -155,10 +155,13 @@ hostname, stop its sessions with that version before switching to this one.
   pasting and again after a 500 ms pause before Enter. An explicit
   `send-keys` or `interrupt` bypasses the dialog guard. The check and send
   are separate calls, and no screen matcher recognizes every dialog.
-- A numbered menu needs a selected cursor row and an adjacent option.
-  Numbered transcript lines, quoted phrases, and a lone `Esc to cancel`
-  footer do not block delivery. Known dialogs use specific headings or
-  multiple cues near the bottom of the capture.
+- A numbered row at the configured prompt blocks delivery even without an
+  adjacent option. This also refuses a composer draft that starts with `1. `.
+  A generic cursor still needs a neighbouring numbered option. Numbered
+  transcript lines above the composer do not block delivery. Known dialogs
+  use specific headings or multiple cues near the bottom of the capture.
+  Unnumbered permission buttons and older single-key approvals may not be
+  recognized unless the program reports OSC `blocked`.
 - Large text is sent in
   UTF-8 chunks; with bracketed paste the program receives a paste group per
   chunk. Multiline or tabbed text requires bracketed paste. Canonical tty
@@ -166,6 +169,7 @@ hostname, stop its sessions with that version before switching to this one.
   Literal ESC and other terminal controls are rejected. A definite first
   paste rejection can be retried. If a dialog stops a paste before Enter,
   a later nudge can proceed once a recognized composer is visibly empty.
+  Known mode and shortcuts footers do not count as draft text.
   An unknown submit result, a visible draft, or a composer whose contents
   cannot be established still requires inspection and `interrupt` or restart.
 - Rex acknowledges that it queued input, not that the program read it. This

@@ -572,7 +572,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("keys", self.block())
 
     def test_late_startup_menu_recovers_only_after_empty_composer(self):
-        empty = "│ ❯\u00a0│\n? for shortcuts\n"
+        empty = "│ ❯\u00a0│\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
         self.patch_backend(new_block={"screen": empty, "post_paste_screen": "Choose\n❯ 1. Yes\n  2. No\n",
                                       "screen_after_explicit_enter": "❯ first turn\n? for shortcuts\n"})
         self.start(nudge="first turn", ready_prompt_prefix="❯ ")
@@ -696,7 +696,8 @@ class RuntimeTest(unittest.TestCase):
             ('1. alpha\n2. beta\nThe manual quotes "Do you want to proceed?" and "permission required"\n', "", "plain"),
             ("     1. alpha\n     2. beta\n", "❯ ", "plain"),
             ("> 1. quoted\n2. beta\n", "", "plain"),
-            ("❯ 1. a draft, not a menu\n? for shortcuts\n", "❯ ", "prompt"),
+            ("❯ 1. a numbered draft\n? for shortcuts\n", "❯ ", "menu"),
+            ("❯ 10000. a numbered draft\n", "❯ ", "menu"),
             ("❯ 1. Yes\n\n  2. No\n", "❯ ", "menu"),
             ("  1. Yes\n┃ › 2. No ┃\n", "", "menu"),
             ("Trust this folder?\nYes or no\n", "", "dialog"),
@@ -705,3 +706,36 @@ class RuntimeTest(unittest.TestCase):
         for capture, prefix, expected in cases:
             with self.subTest(capture=capture):
                 self.assertEqual(terminal.composer(capture.encode(), prefix).kind, expected)
+
+    def test_numbered_question_with_descriptions_refuses_input(self):
+        self.patch_backend(new_block={"screen": "Choose a database\n❯ 1. Postgres\n"
+                                                 "     Shared database\n  2. SQLite\n     Local database\n"})
+        self.start(nudge="never answer", ready_prompt_prefix="❯ ")
+        self.assertTrue(self.op("get-meta", "box", STARTUP_NOTE))
+        self.op("nudge", "box", data=b"never answer", code=1)
+        self.assertNotIn("paste", self.block())
+        self.assertNotIn("keys", self.block())
+        self.patch_block(screen="1. Postgres\n2. SQLite\n❯ \n? for shortcuts\n")
+        self.op("nudge", "box", data=b"next turn")
+        self.assertEqual(self.block()["paste"], ["next turn"])
+        self.assertEqual([key["key"] for key in self.block()["keys"]], ["enter"])
+
+    def test_empty_composer_accepts_only_known_footer_rows(self):
+        for footer in (
+            "⏵⏵ bypass permissions on",
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+            "⏵⏵ don't ask on (shift+tab to cycle)",
+            "⏸ manual mode on · ? for shortcuts · ← for agents",
+            "? for shortcuts                                      ⚠ 1 warning · f2 to view",
+        ):
+            with self.subTest(footer=footer):
+                self.assertTrue(terminal.composer(f"❯ \n{footer}\n".encode(), "❯ ").empty)
+        for draft in (
+            "Explain this setting (shift+tab to cycle)",
+            "⏵⏵ unknown mode on (shift+tab to cycle)",
+            "⏵⏵ bypass permissions on (shift+tab to cycle) plus my notes",
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+        ):
+            with self.subTest(draft=draft):
+                self.assertFalse(terminal.composer(f"❯ \n{draft}\n".encode(), "❯ ").empty)

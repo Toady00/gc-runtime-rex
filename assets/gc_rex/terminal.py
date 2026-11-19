@@ -75,9 +75,12 @@ class Screen(NamedTuple):
     empty: bool = False
 
 
+NUMBERED_ROW = re.compile(r"^([0-9]+)\.(?:\s|$)")
+
+
 def option_number(text):
-    match = re.match(r"^([0-9]{1,4})\.\s", text)
-    return int(match[1]) if match else None
+    match = NUMBERED_ROW.match(text)
+    return int(match[1]) if match and len(match[1]) <= 4 else None
 
 
 def composer(screen, prefix=""):
@@ -93,6 +96,11 @@ def composer(screen, prefix=""):
             rest = prompt_rest(lines[i], marker)
             if rest is None:
                 continue
+            # gc's startup scan rejects numbered configured prompts even
+            # when descriptions separate the choices. A generic glyph still
+            # needs the neighbouring option to rule out ordinary output.
+            if marker == prefix and NUMBERED_ROW.match(rest):
+                return Screen("menu")
             number = option_number(rest)
             if i >= recent and number is not None and any(
                     0 <= j < len(lines) and option_number(lines[j]) in (number - 1, number + 1)
@@ -110,7 +118,17 @@ def composer(screen, prefix=""):
 
 
 def passive_footer(line):
-    return line.lower() == "? for shortcuts" or bool(re.fullmatch(r"[─━═╰╯╭╮└┘┌┐┏┓┗┛╌ ]+", line))
+    # Full rows from gc's Claude approval, composer-clear and idle fixtures.
+    # A suffix match alone would mistake part of a multiline draft for a footer.
+    text = " ".join(line.lower().split())
+    return bool(
+        re.fullmatch(r"[─━═╰╯╭╮└┘┌┐┏┓┗┛╌ ]+", text)
+        or re.fullmatch(r"⏵⏵ (?:bypass permissions|accept edits|don't ask) on"
+                        r"(?: \(shift\+tab to cycle\))?(?: · ← for agents)?", text)
+        or re.fullmatch(r"(?:⏸ manual mode on · )?\? for shortcuts(?: · ← for agents)?", text)
+        # Codex's idle-after-deny capture has this warning on the shortcuts row.
+        or re.fullmatch(r"\? for shortcuts ⚠ [0-9]+ warnings? · f2 to view", text)
+    )
 
 
 def dialog(lines):

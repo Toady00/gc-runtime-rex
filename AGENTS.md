@@ -83,10 +83,12 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   raw tty. `rex send` to that kind of receiver sent LF as LF with no paste
   markers. It accepted 60,000 bytes and refused 65,536 without typing them.
   Do not infer application acceptance from an RPC acknowledgement.
-- Use the newest prompt, tolerating NBSP, a box border, and a footer. A
-  numbered row needs a cursor and a neighbouring option to be a menu.
-  Auto-recover only a paste stopped by a dialog before Enter, and only
-  after a recognized composer is empty. An uncertain Enter is different.
+- Use the newest prompt, tolerating NBSP and box borders. A numbered
+  configured prompt can be a question even when descriptions separate the
+  choices; refuse it. Require a neighbouring option for a generic cursor.
+  Recover a paste stopped before Enter only on an empty composer. Match
+  known mode footers as whole rows, as in gc's `claude_background_stop_test.go`,
+  not by the `shift+tab to cycle` suffix. An uncertain Enter stays pending.
 - `rex capture` always returns the whole scrollback. There is no tail option,
   and its cost grows with scrollback size.
 - The app auto-subscribes to newly created sessions. A new background tab
