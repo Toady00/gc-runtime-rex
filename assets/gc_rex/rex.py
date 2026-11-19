@@ -11,6 +11,53 @@ import uuid
 from .support import Absent, Failure, Unconfirmed
 
 
+# Batched reads use one attached connection. Never cache the server instance
+# across calls. Rex's Lua bridge drops null fields and sends empty arrays
+# back as objects, so give the process's explicit null a wire sentinel.
+INSPECT = """
+local a = rex.args
+local s = rex.call("server.status", {})
+if not s or not s.instance_id then return {error="server.status"} end
+if s.instance_id ~= a.instance then return {gone=true} end
+local function read(method)
+    return rex.call("block.method", {session_id=a.session_id, block_id=a.block_id, method=method})
+end
+local function failed(method, err)
+    -- Rex reports missing blocks/sessions as typed errors in this string.
+    if err and (err:match(" code=not_found%)$") or err:match(" code=session_not_found%)$")) then
+        return {gone=true}
+    end
+    return {error=method}
+end
+local function process()
+    local p, err = read("process")
+    if not p then return nil, failed("process", err) end
+    if not p.last_exit then
+        if not p.child or not p.child.pid or p.child.pid <= 0 then return nil, {error="child PID"} end
+        if p.child.pid ~= a.pid then return nil, {gone=true} end
+        p.last_exit = false
+    end
+    return p
+end
+local p, err = process()
+if not p then return err end
+local result = {instance_id=s.instance_id, process=p}
+for _, method in ipairs(a.methods) do
+    local value, err = read(method)
+    if not value then return failed(method, err) end
+    result[method] = value
+end
+if result.program_status then
+    -- A dying program can leave its final OSC root on screen. Sample exit
+    -- after the root too, without reading that root on an unverified block.
+    p, err = process()
+    if not p then return err end
+    result.process = p
+end
+return result
+"""
+
+
 class Rejected(Failure):
     """Rex rejected the operation before applying it."""
 
@@ -75,6 +122,34 @@ class Rex:
     def process(self, target):
         return self.method(target, "process")
 
+    def inspect(self, target, instance, pid, *methods):
+        args = dict(target, instance=instance, pid=pid, methods=methods)
+        reply = json.loads(self.cli("do", "-s", target["session_id"], "--json", "-e", INSPECT,
+                                    "--args", "-", data=encode(args)))
+        if reply.get("gone") is True:
+            raise Absent()
+        if "error" in reply:
+            detail = reply["error"]
+            if detail not in {"server.status", "process", "child PID", *methods}:
+                detail = "unknown read"
+            raise Failure(f"Rex observation failed: {detail}")
+        if reply["instance_id"] != instance:
+            raise Absent()
+        process = reply["process"]
+        if process["last_exit"] is False:
+            if process["child"]["pid"] != pid:
+                raise Absent()
+            process["last_exit"] = None
+        elif not isinstance(process["last_exit"], dict):
+            raise Failure("Rex observation omitted the process liveness discriminator")
+        if "size" in reply:
+            reply["size"].setdefault("owner", None)
+            if reply["size"].get("desired") == {}:
+                reply["size"]["desired"] = []
+        if "program_status" in reply and reply["program_status"].get("records") == {}:
+            reply["program_status"]["records"] = []
+        return reply
+
     def instance(self):
         return str(uuid.UUID(self.api("server.status")["instance_id"]))
 
@@ -94,8 +169,6 @@ class Rex:
         self.api("block.event", **target, event={"type": "paste", "payload": {"text": text}})
 
     def snapshot(self, target, *methods):
-        # rex do converts JSON nulls to missing Lua fields. Keep the direct
-        # reply so a missing last_exit is distinguishable from a live process.
         return {method: self.method(target, method) for method in methods}
 
 

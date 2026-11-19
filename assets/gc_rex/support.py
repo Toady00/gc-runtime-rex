@@ -180,9 +180,10 @@ class Store:
     def lock(self, stem, *, family="name", collision=False):
         private_dir(self.root.parent)
         private_dir(self.root)
-        # A fixed set avoids accumulating one lock inode per retired name.
-        # Never unlink lock files while a waiter may still hold their inode.
-        leaf = stem if stem == "city" else family + "-" + stem[:2]
+        # Only the exact name can report a lifecycle collision. Observation
+        # locks can share buckets because they wait rather than report 73.
+        # Never unlink a lock file while a waiter may still hold its inode.
+        leaf = stem if stem == "city" else family + "-" + (stem if family == "name" else stem[:2])
         fd = os.open(self.root / (leaf + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             while True:

@@ -2,6 +2,7 @@
 
 import os
 import re
+from typing import NamedTuple
 
 from .support import Failure
 
@@ -69,52 +70,87 @@ def prompt_rest(line, prefix):
     return None
 
 
+class Screen(NamedTuple):
+    kind: str
+    empty: bool = False
+
+
+def option_number(text):
+    match = re.match(r"^([0-9]{1,4})\.\s", text)
+    return int(match[1]) if match else None
+
+
 def composer(screen, prefix=""):
-    """Classify the recent screen without treating a menu cursor as a prompt."""
-    lines = [normalized(line) for line in tail(screen, 120).decode("utf-8", "replace").split("\n")]
-    lines = [line for line in lines if line]
-    prefixes = tuple(dict.fromkeys(filter(None, (prefix, "❯ ", "› ", "> ", "● ", "→ "))))
+    """Read the newest composer and distinguish live dialog evidence from history."""
+    lines = [line for raw in tail(screen, 120).decode("utf-8", "replace").split("\n")
+             if (line := normalized(raw))]
+    # A bare '>' is common in shell/transcript quotes. Only treat it as a
+    # cursor when the program explicitly configured it as the prefix.
+    prefixes = tuple(dict.fromkeys(filter(None, (prefix, "❯ ", "› ", "● ", "→ "))))
+    recent = max(0, len(lines) - 16)
     for i in range(len(lines) - 1, -1, -1):
         for marker in prefixes:
             rest = prompt_rest(lines[i], marker)
             if rest is None:
                 continue
-            if re.match(r"^[0-9]+\.(?:\s|$)", rest):
-                return "menu"
-            if marker == prefix:
-                return "prompt" if not dialog(lines[i + 1:]) else "dialog"
-            # A bare generic prompt ends the transcript before it, but does
-            # not substitute for a separately configured readiness prefix.
-            if not rest:
-                return "plain" if not dialog(lines[i + 1:]) else "dialog"
-    if dialog(lines):
-        return "dialog"
-    # Menus without a highlighted row: require consecutive numbered rows.
-    # A terminal draft pasted at the real composer is handled above.
-    for prev, current in zip(lines, lines[1:]):
-        a, b = re.match(r"^([0-9]{1,4})\.\s", prev), re.match(r"^([0-9]{1,4})\.\s", current)
-        if a and b and int(b[1]) == int(a[1]) + 1:
-            return "menu"
-    return "plain"
+            number = option_number(rest)
+            if i >= recent and number is not None and any(
+                    0 <= j < len(lines) and option_number(lines[j]) in (number - 1, number + 1)
+                    for j in (i - 1, i + 1)):
+                return Screen("menu")
+            if marker == prefix or not rest:
+                below = lines[i + 1:]
+                if dialog(below[-16:]):
+                    return Screen("dialog")
+                # A line under a bare prompt could be a wrapped draft.
+                # Only known passive footer rows and box rules prove empty.
+                empty = not rest and all(passive_footer(line) for line in below)
+                return Screen("prompt" if marker == prefix else "plain", empty)
+    return Screen("dialog" if dialog(lines[recent:]) else "plain")
+
+
+def passive_footer(line):
+    return line.lower() == "? for shortcuts" or bool(re.fullmatch(r"[─━═╰╯╭╮└┘┌┐┏┓┗┛╌ ]+", line))
 
 
 def dialog(lines):
-    # Join the recent rows so a wrapped title or question footer still vetoes
-    # delivery. This is a refusal guard, not a parser for answering the dialog.
-    text = " ".join(" ".join(lines).lower().split())
-    return any(phrase in text for phrase in (
-        "trust this folder", "trust project folder?", "quick safety check",
-        "do you trust the contents of this directory", "do you trust the files in this folder",
-        "trust and continue", "new mcp server found", "hooks need review", "bypass permissions mode",
-        "do you want to use this api key", "detected a custom api key", "usage limit reached",
-        "you've hit your limit", "/rate-limit-options", "do you want to proceed?",
-        "would you like to run the following command", "would you like to make the following edits",
-        "would you like to grant these permissions", "would you like to send input to",
-        "do you want to approve network access", "do you want to make this edit", "approve edits?",
-        "allow this action?", "permission required", "needs your approval", "esc to cancel",
-        "enter to confirm", "ready to submit your answers?",
-    )) or ("keep current model" in text and "switch to " in text) or (
-        "1: bad" in text and "3: good" in text and "0: dismiss" in text)
+    rows = [" ".join(line.lower().split()) for line in lines]
+    # Companion cues from gc's startup dialog recognizers. Match whole
+    # headings where no second cue is needed, never an isolated substring.
+    if any(row in {
+        "trust this folder?", "trust project folder?", "do you trust the contents of this directory?",
+        "do you trust the files in this folder?", "do you want to use this api key?",
+        "usage limit reached", "you've hit your limit",
+    } for row in rows):
+        return True
+    text = " ".join(rows)
+    cues = (
+        ("choose the text style", "/theme"),
+        ("resume from summary", "resume full session as-is", "enter to confirm"),
+        ("update available!", "skip until next version", "press enter to continue"),
+        ("quick safety check", "trust this folder"),
+        ("allow external claude.md", "allow external imports"),
+        ("new mcp server found", "use this and all future mcp servers"),
+        ("hooks need review", "trust all", "continue without trusting"),
+        ("hooks need review", "trust all", "enter to review hooks"),
+        ("bypass permissions mode", "yes, i accept"),
+        ("detected a custom api key", "no (recommended)"),
+        ("rate limit", "keep trying", "stop"),
+        ("ready to submit your answers?", "submit answers", "cancel"),
+        ("keep current model", "switch to "),
+    )
+    if any(all(cue in text for cue in group) for group in cues):
+        return True
+    if any(all(cue in row for cue in ("1: bad", "2: fine", "3: good", "0: dismiss")) for row in rows):
+        return True
+    # Wrapped bottom action footer. Neither 'esc to cancel' nor 'enter
+    # to confirm' on its own identifies a dialog under a live composer.
+    for count in range(1, min(3, len(rows)) + 1):
+        footer = " ".join(rows[-count:])
+        if (re.fullmatch(r"enter to select\b.*\besc to cancel", footer) or
+                re.fullmatch(r"press \S.+ to confirm\b.*\b\S+ to (?:cancel|go back)(?: or .* to open thread)?", footer)):
+            return True
+    return False
 
 
 def chunks(text, limit=24 * 1024):

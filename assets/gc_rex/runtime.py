@@ -14,6 +14,7 @@ import time
 import uuid
 
 from . import staging, terminal
+from .launch import PIPE_WAIT
 from .rex import Rejected, Rex, encode, object_id
 from .support import Absent, Budget, Cancelled, Deadline, Failure, Store, Unconfirmed, atomic_json, read_json
 
@@ -23,6 +24,9 @@ DRIVING = {"nudge", "send-keys", "interrupt", "clear-scrollback"}
 OBSERVERS = {"get-meta", "is-running", "process-alive", "peek", "get-last-activity", "is-attached", "program-status"}
 STARTUP_NOTE = "GC_STARTUP_DELIVERY_UNCONFIRMED"
 PASTE_SETTLE = 0.5
+READY_SETTLE = 0.4
+# A late launch can spend a CLI timeout in flight, then wait for the pipe.
+ORPHAN_GRACE = PIPE_WAIT + 3
 ACTIVITY_SAMPLE = 2.0
 ARITY = {
     **dict.fromkeys(("start", "stop", "is-running", "nudge", "interrupt", "clear-scrollback",
@@ -30,6 +34,10 @@ ARITY = {
     **dict.fromkeys(("peek", "set-meta", "get-meta", "remove-meta"), 2),
     "copy-to": 3,
 }
+
+
+class PendingChoice(Failure):
+    """A dialog vetoed input before submission was attempted."""
 
 
 def config(data):
@@ -73,6 +81,12 @@ def rfc3339(value):
 
 def target(row):
     return {kind + "_id": object_id(row[kind + "_id"], kind) for kind in ("session", "block")}
+
+
+def check_launch_pipe(fd):
+    st = os.fstat(fd)
+    if not stat.S_ISFIFO(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        raise Failure("Rex launcher did not provide a private launch pipe")
 
 
 class Runtime:
@@ -148,7 +162,7 @@ class Runtime:
         if self.rex.instance() != row["instance"]:
             return  # A restored block is not our process, even if the ID survived.
         try:
-            if row.get("pid") and self.inspect_process(row, verify_instance=False) is None:
+            if row.get("pid") and self.direct_process(row) is None:
                 return
             self.rex.api("block.close", **target(row))
         except Absent:
@@ -165,19 +179,27 @@ class Runtime:
                     if info:
                         self.close_block(dict(row, **info))
                         self.delete_row(path, row)
+                    elif row and time.time() - path.stat().st_mtime >= ORPHAN_GRACE:
+                        # With no receipt there is no authorized ID to close.
+                        self.delete_row(path, row)
                 except Cancelled:
                     raise
                 except (Failure, OSError, ValueError, KeyError):
                     print("Rex runtime: late window cleanup not confirmed", file=sys.stderr)
 
     def process(self, row):
+        reading = self.observation(row)
+        return reading["process"] if reading is not None else None
+
+    def observation(self, row, *methods):
         if not row or not row.get("pid"):
             return None
-        return self.inspect_process(row)
-
-    def inspect_process(self, row, *, verify_instance=True):
-        if verify_instance and self.rex.instance() != row["instance"]:
+        try:
+            return self.rex.inspect(target(row), row["instance"], row["pid"], *methods)
+        except Absent:
             return None
+
+    def direct_process(self, row):
         try:
             process = self.rex.process(target(row))
         except Absent:
@@ -211,9 +233,7 @@ class Runtime:
             if self.rex.instance() != row["instance"]:
                 raise Failure("Rex restarted before launch configuration was sent")
             fd = os.open(handoff, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-            st = os.fstat(fd)
-            if not stat.S_ISFIFO(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-                raise Failure("Rex launcher did not provide a private launch pipe")
+            check_launch_pipe(fd)
             data = memoryview(encode({"uid": os.geteuid(), "machine_override": os.environ.get("GC_REX_MACHINE_ID"),
                                       "work_dir": str(work), "command": cfg.get("command", ""), "env": cfg["env"],
                                       "strip_rex_env": os.environ.get("GC_REX_STRIP_ENV") == "1"}) + b"\n")
@@ -253,17 +273,14 @@ class Runtime:
     def status(self, row, path):
         cache = self.handoff(row).with_suffix(".status")
         with self.store.lock(path.stem, family="status"):
-            if row["instance"] != self.rex.instance():
-                raise Absent()
-            reports = self.rex.method(target(row), "program_status")
-            process = self.inspect_process(row, verify_instance=False)
-            if process is None:
+            reading = self.observation(row, "program_status")
+            if reading is None:
                 raise Absent()
             current = dict(row)
             previous = read_json(cache)
             if previous:
                 current["reporter"] = copy.deepcopy(previous)
-            answer = terminal.status_answer(current, {"program_status": reports, "process": process})
+            answer = terminal.status_answer(current, reading)
             if previous != current.get("reporter"):
                 self.write_observation(path, row, cache, current["reporter"])
             return answer
@@ -303,7 +320,7 @@ class Runtime:
         delay = 0 if prefix else cfg.get("ready_delay_ms", 0) / 1000
         started = time.monotonic()
         deadline = min(self.budget.end - 1.2, started + (min(delay + 5, 60) if delay else 15))
-        raw_since = None
+        ready_since = None
         while True:
             # A readiness timeout is not a failed launch. Do not type into an
             # unproven composer just because the start budget is expiring.
@@ -316,22 +333,25 @@ class Runtime:
                 with self.budget.until(deadline):
                     state, view = self.input_look(row)
                     modes = (self.rex.snapshot(target(row), "modes", "input_mode")
-                             if not prefix and not delay and state == "" and view == "plain" else None)
+                             if not prefix and not delay and state not in ("idle", "blocked") and
+                             view.kind == "plain" else None)
             except (Deadline, Unconfirmed):
                 process = self.process(row)
                 if not process or not terminal.alive(process):
                     raise
                 return self.withhold(path, row, "readiness timeout while observing the terminal")
-            if view in ("dialog", "menu") or state == "blocked":
+            if view.kind in ("dialog", "menu") or state == "blocked":
                 return self.withhold(path, row, "terminal is waiting for a dialog or menu choice")
             now = time.monotonic()
-            ready = (view == "prompt" if prefix else now >= started + delay if delay else state == "idle")
-            if modes is not None:
-                raw = terminal.bracketed_paste(modes["modes"]) and not modes["input_mode"]["canonical"]
-                raw_since = (raw_since if raw_since is not None else now) if raw else None
-                ready = raw_since is not None and now - raw_since >= 0.4
+            if delay:
+                ready = now >= started + delay
+            elif not prefix and state == "idle":
+                ready = True
             else:
-                raw_since = None
+                observed = view.kind == "prompt" if prefix else (
+                    modes is not None and terminal.bracketed_paste(modes["modes"]) and not modes["input_mode"]["canonical"])
+                ready_since = (ready_since if ready_since is not None else now) if observed else None
+                ready = ready_since is not None and now - ready_since >= READY_SETTLE
             if ready and time.monotonic() < deadline:
                 try:
                     self.deliver(path, row, terminal.input_text(text))
@@ -403,12 +423,13 @@ class Runtime:
                 self.handoff(row).unlink(missing_ok=True)
 
     def deliver(self, path, row, text):
-        if row.get("input_pending"):
-            raise Failure("earlier nudge may have been partially delivered; inspect terminal and interrupt before retrying")
         block = target(row)
         if not text:
             return
-        self.guard_input(row)
+        view = self.guard_input(row)
+        pending = row.get("input_pending")
+        if pending and not (pending == "unsubmitted" and view.empty):
+            raise Failure("earlier nudge may have been partially delivered; inspect terminal and interrupt before retrying")
         terminal.check_paste(self.rex, block, text)
         self.budget.remaining(0.6)
         row["input_pending"] = True
@@ -425,6 +446,12 @@ class Runtime:
             time.sleep(PASTE_SETTLE)
             self.guard_input(row)
             self.rex.keys(block, ["enter"])
+        except PendingChoice:
+            # The guard ran before Enter (or before a later paste chunk).
+            # A future empty composer proves this abandoned draft is gone.
+            row["input_pending"] = "unsubmitted"
+            atomic_json(path, row)
+            raise
         except (Rejected, Deadline):
             if not accepted:
                 self.clear_pending(path, row)
@@ -439,15 +466,19 @@ class Runtime:
 
     def guard_input(self, row):
         state, view = self.input_look(row)
-        if state == "blocked" or view in ("dialog", "menu"):
-            raise Failure("nudge withheld: terminal is waiting for a dialog or menu choice")
+        if state == "blocked" or view.kind in ("dialog", "menu"):
+            raise PendingChoice("nudge withheld: terminal is waiting for a dialog or menu choice")
+        return view
 
     def clear_pending(self, path, row):
         if row.pop("input_pending", None):
             atomic_json(path, row)
 
     def attachment(self, row):
-        size = self.rex.method(target(row), "size")
+        reading = self.observation(row, "size")
+        if reading is None:
+            raise Absent()
+        size = reading["size"]
         # The app subscribes to all sessions. Block ownership and per-block
         # size requests indicate interaction rather than a global subscription.
         if "owner" not in size or not isinstance(size.get("desired"), list):
@@ -466,6 +497,9 @@ class Runtime:
         block = target(row)
         cache = self.handoff(row).with_suffix(".activity")
         with self.store.lock(path.stem, family="activity"):
+            observation = self.observation(row, "program_status")
+            if observation is None:
+                raise Absent()
             previous = read_json(cache) or {"activity": row["activity"], "sample": -ACTIVITY_SAMPLE}
             reading = dict(previous)
             # On macOS Python 3.9 monotonic origins differ across processes.
@@ -476,7 +510,7 @@ class Runtime:
                 if previous.get("screen") != screen:
                     candidates.append(timestamp())
                 reading.update(screen=screen, sample=now)
-            status = self.rex.method(block, "program_status")
+            status = observation["program_status"]
             candidates.extend(r["updated_at"] for r in status["records"])
             reading["activity"] = max(candidates, key=rfc3339)
             if reading != previous:
@@ -558,16 +592,12 @@ class Runtime:
         if op == "program-status":
             print(json.dumps(self.status(row, path), separators=(",", ":")))
         elif op == "is-attached":
-            if self.process(row) is None:
-                raise Absent()
             print(str(self.attachment(row)).lower())
         elif op == "peek":
             if self.process(row) is None:
                 raise Absent()
             sys.stdout.buffer.write(terminal.tail(self.rex.capture(block), int(args[0])))
         elif op == "get-last-activity":
-            if self.process(row) is None:
-                raise Absent()
             print(self.activity(path, row))
         elif op == "copy-to":
             if self.process(row) is not None:

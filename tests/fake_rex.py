@@ -18,10 +18,15 @@ def save(path, data):
     tmp.replace(path)
 
 
-def launcher(path, session, block, delay):
+def launcher(path, session, block, delay, pipe_kind):
     receipt = {"session_id": session, "block_id": block, "pid": 101, "ready": False}
     time.sleep(float(delay))
-    os.mkfifo(path, 0o600)
+    if pipe_kind == "regular":
+        path.touch(mode=0o600)
+    else:
+        os.mkfifo(path, 0o600)
+        if pipe_kind == "shared":
+            path.chmod(0o666)
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     try:
         save(path.with_suffix(".receipt"), receipt)
@@ -45,6 +50,21 @@ def launcher(path, session, block, delay):
         os.close(fd)
         path.unlink(missing_ok=True)
     return 1
+
+
+def block_read(live, method):
+    if method == "process":
+        result = {"last_exit": live.get("exit"), "child": {"pid": live.get("pid", 101), "name": live.get("image", "test-agent")}}
+        if "path" in live:
+            result["child"]["path"] = live["path"]
+        if "foreground" in live:
+            result["foreground"] = live["foreground"]
+        return result
+    if method == "program_status":
+        return {"records": live.get("program_status", [])}
+    if method == "size":
+        return live.get("size", {"owner": None, "desired": []})
+    raise AssertionError(method)
 
 
 def main():
@@ -78,8 +98,23 @@ def main():
     live = state["blocks"].get(block)
     result = {}
     dirty = False
-    if method == "server.status":
-        result = {"instance_id": state.get("instance_id", "00000000-0000-0000-0000-000000000001")}
+    instance = state.get("instance_id", "00000000-0000-0000-0000-000000000001")
+    if method == "do":
+        assert argv[1:4] == ["-s", args["session_id"], "--json"]
+        if args["instance"] != instance:
+            result = {"gone": True}
+        else:
+            process = block_read(live, "process")
+            if process["last_exit"] is None:
+                process["last_exit"] = False
+                if process["child"]["pid"] != args["pid"]:
+                    print('{"gone":true}')
+                    return 0
+            result = {"instance_id": instance, "process": process}
+            for field in args["methods"]:
+                result[field] = {k: ({} if v == [] else v) for k, v in block_read(live, field).items() if v is not None}
+    elif method == "server.status":
+        result = {"instance_id": instance}
     elif method == "session.list":
         result = {"sessions": []}
     elif method == "session.create":
@@ -99,6 +134,9 @@ def main():
         if state.get("create_error"):
             print("test request rejected (status=400 code=bad_request)", file=sys.stderr)
             return state["create_error"]
+        if state.get("lost_create_without_launcher"):
+            print("unexpected EOF", file=sys.stderr)
+            return 1
         options = args["layout"]["block"]["options"]
         assert options["shell"] == "none" and options["login"] is False
         assert options["exit"] == {"on_completion": False}
@@ -107,7 +145,8 @@ def main():
         block = f"block:{uuid.uuid4()}"
         reported = f"block:{uuid.uuid4()}" if state.get("receipt_mismatch") else block
         subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "launch", str(handoff),
-                          state["session_id"], reported, str(state.get("receipt_delay", 0))],
+                           state["session_id"], reported, str(state.get("receipt_delay", 0)),
+                           state.get("pipe_kind", "private")],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         state["blocks"][block] = dict(state.get("new_block", {}))
         if "boot_seconds" in state["blocks"][block]:
@@ -125,21 +164,13 @@ def main():
         dirty = True
     elif method == "block.method":
         fn = args["method"]
-        if fn == "process":
-            result = {"last_exit": live.get("exit"), "child": {"pid": live.get("pid", 101), "name": live.get("image", "test-agent")}}
-            if "path" in live:
-                result["child"]["path"] = live["path"]
-            if "foreground" in live:
-                result["foreground"] = live["foreground"]
-        elif fn == "program_status":
-            result = {"records": live.get("program_status", [])}
+        if fn in ("process", "program_status", "size"):
+            result = block_read(live, fn)
         elif fn == "modes":
             result = {"modes": [{"number": 2004, "set": live.get("bracketed", True) and
                                  time.time() >= live.get("ready_at", 0)}]}
         elif fn == "input_mode":
             result = {"canonical": live.get("canonical", False) or time.time() < live.get("ready_at", 0)}
-        elif fn == "size":
-            result = live.get("size", {"owner": None, "desired": []})
         elif fn == "clear":
             live["screen"] = "\n"
             dirty = True
@@ -149,6 +180,9 @@ def main():
         result = {"clients": state.get("clients", [])}
     elif method == "capture":
         time.sleep(live.get("capture_delay", 0))
+        if live.get("track_first_capture") and "first_capture" not in live:
+            live["first_capture"] = time.time()
+            save(fixture, state)
         sys.stdout.write(live.get("screen", "one\ntwo\nprompt> \n"))
         return 0
     elif method == "block.event":
@@ -167,6 +201,13 @@ def main():
         else:
             live.setdefault("keys", []).append(payload)
             live["key_at"] = time.time()
+            if payload["key"] == "enter" and live.get("lose_submit_reply"):
+                save(fixture, state)
+                print("unexpected EOF", file=sys.stderr)
+                return 1
+            if payload["key"] == "enter" and "screen_after_explicit_enter" in live:
+                live["screen"] = live.pop("screen_after_explicit_enter")
+                live.pop("post_paste_screen", None)
         dirty = True
     else:
         raise AssertionError(method)

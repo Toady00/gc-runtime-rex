@@ -3,10 +3,12 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest import mock
@@ -17,8 +19,8 @@ OP = ASSETS / "gc-runtime-rex"
 sys.path.insert(0, str(ASSETS))
 from gc_rex import terminal
 from gc_rex.machine import machine_id
-from gc_rex.runtime import ARITY, STARTUP_NOTE
-from gc_rex.support import Budget, Store
+from gc_rex.runtime import ARITY, ORPHAN_GRACE, STARTUP_NOTE, check_launch_pipe
+from gc_rex.support import Budget, Failure, Store, digest
 
 
 class RuntimeTest(unittest.TestCase):
@@ -71,8 +73,8 @@ class RuntimeTest(unittest.TestCase):
     def state_row(self):
         return next(p for p in self.state_dir().glob("*.json") if p.name != "city.json")
 
-    def starting(self, cfg, budget="4300"):
-        p = subprocess.Popen([str(OP), "start", "box"], env=dict(self.env, GC_EXEC_DEADLINE_MS=budget),
+    def starting(self, cfg, budget="4300", name="box"):
+        p = subprocess.Popen([str(OP), "start", name], env=dict(self.env, GC_EXEC_DEADLINE_MS=budget),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p.stdin.write(json.dumps(cfg).encode())
         p.stdin.close()
@@ -356,6 +358,32 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(self.backend()["blocks"]), 1)
         self.assertFalse(list(self.state_dir().glob("*.orphan")))
 
+    def test_lost_create_without_launcher_expires(self):
+        self.patch_backend(lost_create_without_launcher=True)
+        self.start(code=1)
+        orphan = next(self.state_dir().glob("*.orphan"))
+        self.op("stop", "box")
+        self.assertTrue(orphan.exists())
+        old = time.time() - ORPHAN_GRACE - 1
+        os.utime(orphan, (old, old))
+        self.op("stop", "box")
+        self.assertFalse(orphan.exists())
+        self.assertEqual(self.backend()["blocks"], {})
+
+    def test_controller_refuses_nonprivate_launch_fd_before_writing(self):
+        for pipe_kind in ("regular", "shared"):
+            with self.subTest(pipe_kind=pipe_kind):
+                self.patch_backend(pipe_kind=pipe_kind)
+                result = subprocess.run([str(OP), "start", "box"], input=b"{}", env=self.env,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b"private launch pipe", result.stderr)
+                self.assertEqual(self.backend()["blocks"], {})
+        with mock.patch("gc_rex.runtime.os.fstat", return_value=SimpleNamespace(
+                st_mode=stat.S_IFIFO | 0o600, st_uid=os.geteuid() + 1)):
+            with self.assertRaisesRegex(Failure, "private launch pipe"):
+                check_launch_pipe(12)
+
     def test_readers_tolerate_abandoned_pre_create_row(self):
         self.start()
         row_file = self.state_row()
@@ -403,6 +431,7 @@ class RuntimeTest(unittest.TestCase):
         for changes in ({"pid": 202}, {"server": "00000000-0000-0000-0000-000000000002"}):
             name = "other" if "server" in changes else "box"
             self.start(name)
+            block_ids = set(self.backend()["blocks"])
             if "server" in changes:
                 self.patch_backend(instance_id=changes["server"])
             else:
@@ -412,7 +441,7 @@ class RuntimeTest(unittest.TestCase):
             self.op("program-status", name, code=66)
             self.op("nudge", name, data=b"untouched")
             self.op("stop", name)
-            self.assertTrue(self.backend()["blocks"])
+            self.assertEqual(set(self.backend()["blocks"]), block_ids)
             self.assertTrue(all("paste" not in b for b in self.backend()["blocks"].values()))
 
     def test_city_state_is_stable_across_hostname_changes(self):
@@ -462,12 +491,32 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, stderr)
         self.assertEqual(self.backend()["blocks"], {})
 
+    def test_two_names_in_the_old_bucket_can_start_independently(self):
+        first, second = "worker-21", "worker-25"
+        self.assertEqual(digest(first)[:2], digest(second)[:2])
+        p = self.starting({"nudge": "hold", "ready_prompt_prefix": "not-present"}, budget="7000", name=first)
+        until = time.monotonic() + 4
+        while self.op("is-running", first) == b"false\n":
+            self.assertLess(time.monotonic(), until)
+            time.sleep(0.02)
+        self.start(second)
+        self.assertIsNone(p.poll())
+        self.assertEqual(self.op("list-running", "worker-"), b"worker-21\nworker-25\n")
+        self.start(first, code=73)
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=2)
+        self.assertEqual(p.returncode, 143)
+        self.assertEqual(self.op("list-running", "worker-"), b"worker-25\n")
+
     def test_tui_prompt_above_footer_with_nbsp_and_border(self):
         self.patch_backend(new_block={"screen": "welcome\n│ ❯\u00a0│\n? for shortcuts\n",
+                                      "track_first_capture": True,
                                       "program_status": [{"state": "working", "owner": {"pid": 101, "name": "test-agent"}}]})
+        self.env["GC_EXEC_DEADLINE_MS"] = "5500"
         self.start(nudge="first", ready_prompt_prefix="❯ ", ready_delay_ms=90000)
         self.assertEqual(self.block()["paste"], ["first"])
         self.assertEqual(self.block()["keys"][0]["key"], "enter")
+        self.assertGreaterEqual(self.block()["pasted_at"] - self.block()["first_capture"], 0.4)
 
     def test_numbered_menu_or_trust_dialog_withholds_start_and_nudge(self):
         screens = ("Confirm option\n❯ 1. Something\n  2. Cancel\n? for shortcuts\n", "Trust this folder?\n[yes/no]\n")
@@ -492,7 +541,9 @@ class RuntimeTest(unittest.TestCase):
             self.op("stop", "box")
 
     def test_no_hints_waits_for_raw_bracketed_paste(self):
-        self.patch_backend(new_block={"boot_seconds": 0.45})
+        self.patch_backend(new_block={"boot_seconds": 0.45, "program_status": [
+            {"state": "working", "owner": {"pid": 101, "name": "test-agent"}}]})
+        self.env["GC_EXEC_DEADLINE_MS"] = "5500"
         self.start(nudge="first\nsecond")
         self.assertEqual(self.block()["paste"], ["first\nsecond"])
         self.assertGreaterEqual(self.block()["pasted_at"], self.block()["ready_at"] + 0.4)
@@ -504,13 +555,49 @@ class RuntimeTest(unittest.TestCase):
 
     def test_blocked_osc_and_menu_after_paste_prevent_submit(self):
         self.start()
-        self.patch_block(program_status=[{"state": "blocked", "owner": {"pid": 101, "name": "test-agent"}}])
+        self.patch_block(program_status=[{"state": "blocked", "owner": {"pid": 999, "name": "test-agent"}}])
+        self.assertEqual(json.loads(self.op("program-status", "box"))["state"], "")
         self.op("nudge", "box", data=b"untouched", code=1)
         self.assertNotIn("paste", self.block())
         self.patch_block(program_status=[], post_paste_screen="Do you want to proceed?\n❯ 1. Yes\n  2. No\n")
         self.op("nudge", "box", data=b"may be staged", code=1)
         self.assertEqual(self.block()["paste"], ["may be staged"])
         self.assertNotIn("keys", self.block())
+
+    def test_menu_between_paste_chunks_prevents_second_chunk(self):
+        self.start()
+        self.patch_block(post_paste_screen="Make a choice\n › 1. Yes\n  2. No\n")
+        self.op("nudge", "box", data=b"x" * 24576 + b"second chunk", code=1)
+        self.assertEqual(self.block()["paste"], ["x" * 24576])
+        self.assertNotIn("keys", self.block())
+
+    def test_late_startup_menu_recovers_only_after_empty_composer(self):
+        empty = "│ ❯\u00a0│\n? for shortcuts\n"
+        self.patch_backend(new_block={"screen": empty, "post_paste_screen": "Choose\n❯ 1. Yes\n  2. No\n",
+                                      "screen_after_explicit_enter": "❯ first turn\n? for shortcuts\n"})
+        self.start(nudge="first turn", ready_prompt_prefix="❯ ")
+        self.assertEqual(self.block()["paste"], ["first turn"])
+        self.assertNotIn("keys", self.block())
+        self.assertTrue(self.op("get-meta", "box", STARTUP_NOTE))
+        self.op("send-keys", "box", "Down", "Enter")
+        self.op("nudge", "box", data=b"first turn", code=1)
+        self.patch_block(screen="❯ \nwrapped draft\n? for shortcuts\n")
+        self.op("nudge", "box", data=b"first turn", code=1)
+        self.assertEqual(self.block()["paste"], ["first turn"])
+        self.patch_block(screen=empty)
+        self.op("nudge", "box", data=b"later turn")
+        self.assertEqual(self.block()["paste"], ["first turn", "later turn"])
+        self.assertEqual([key["key"] for key in self.block()["keys"]], ["arrow_down", "enter", "enter"])
+        self.assertEqual(self.op("get-meta", "box", STARTUP_NOTE), b"")
+
+    def test_lost_submit_reply_stays_pending_even_on_empty_composer(self):
+        self.start(ready_prompt_prefix="❯ ")
+        self.patch_block(screen="❯ \n", lose_submit_reply=True)
+        self.op("nudge", "box", data=b"first turn", code=1)
+        self.patch_block(lose_submit_reply=False)
+        self.op("nudge", "box", data=b"first turn", code=1)
+        self.assertEqual(self.block()["paste"], ["first turn"])
+        self.assertEqual([key["key"] for key in self.block()["keys"]], ["enter"])
 
     def test_sigterm_reaps_ignoring_child(self):
         self.start()
@@ -600,5 +687,21 @@ class RuntimeTest(unittest.TestCase):
 
     def test_wrapped_dialog_footer_and_history(self):
         dialog = b"Pick an option\nA text field\nEnter to select or Esc\nto cancel\n"
-        self.assertEqual(terminal.composer(dialog, "❯ "), "dialog")
-        self.assertEqual(terminal.composer(dialog + "❯ \u00a0\n? for shortcuts\n".encode(), "❯ "), "prompt")
+        self.assertEqual(terminal.composer(dialog, "❯ ").kind, "dialog")
+        self.assertEqual(terminal.composer(dialog + "❯ \u00a0\n? for shortcuts\n".encode(), "❯ "), terminal.Screen("prompt", True))
+
+    def test_dialog_classifier_requires_live_menu_or_dialog_evidence(self):
+        cases = [
+            ("1. alpha\n2. beta\n❯ \nEsc to cancel\n", "❯ ", "prompt"),
+            ('1. alpha\n2. beta\nThe manual quotes "Do you want to proceed?" and "permission required"\n', "", "plain"),
+            ("     1. alpha\n     2. beta\n", "❯ ", "plain"),
+            ("> 1. quoted\n2. beta\n", "", "plain"),
+            ("❯ 1. a draft, not a menu\n? for shortcuts\n", "❯ ", "prompt"),
+            ("❯ 1. Yes\n\n  2. No\n", "❯ ", "menu"),
+            ("  1. Yes\n┃ › 2. No ┃\n", "", "menu"),
+            ("Trust this folder?\nYes or no\n", "", "dialog"),
+            ("New MCP server found\nUse this and all future MCP servers\n", "", "dialog"),
+        ]
+        for capture, prefix, expected in cases:
+            with self.subTest(capture=capture):
+                self.assertEqual(terminal.composer(capture.encode(), prefix).kind, expected)

@@ -16,6 +16,9 @@ else:
     from machine import machine_id
 
 
+PIPE_WAIT = 5
+
+
 def overlay(base, updates):
     env = dict(base)
     for key, value in updates.items():
@@ -48,7 +51,7 @@ def receive(path, receipt):
         if not stat.S_ISFIFO(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
             raise ValueError("invalid launch pipe")
         publish_receipt(path, receipt)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + PIPE_WAIT
         data = bytearray()
         while time.monotonic() < deadline:
             try:
@@ -89,7 +92,7 @@ def launch(path, expected_session, expected_host):
     publish_receipt(path, dict(receipt, ready=True))
     argv = ["/bin/sh", "-c", cfg["command"]] if cfg["command"] else ["/bin/sh", "-i"]
     # Match subprocess's restore_signals: exec preserves ignored signals.
-    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+    for name in ("SIGPIPE", "SIGXFSZ"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), signal.SIG_DFL)
     os.execve(argv[0], argv, env)
