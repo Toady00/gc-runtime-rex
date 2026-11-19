@@ -45,35 +45,61 @@ and say how it was verified.
 
 ## Rex pitfalls
 
-Observed on Rex server `0.0.1793981048` (API revision 11), macOS. The server
-has since been upgraded to `0.1.0-preview.21` (API revision 18); recheck each
-item there before relying on it, and update this list.
+Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
 
 - The `rex` binary is not on a minimal `PATH` and its path contains spaces.
   Resolve an absolute path and never build a shell string from it.
-- With `HOME` changed, `rex` looks for the server socket under the new `HOME`
-  and can start a second server there. Set `REX_RUNTIME_DIR` (or
-  `REX_SERVER`) from the real account home, found through the password
-  database, not `HOME`.
-- A terminal gets the server's environment, not the caller's. There is no
-  env option. Pass session env through an `env`-style wrapper, and treat an
-  empty value in the start config as "unset".
+- Set an explicit `REX_SERVER=unix:///...` from the password database, not
+  `HOME`. With `REX_AUTOSTART=0`, `whoami` on a missing socket exited 4 on
+  rev 18 without falling back to the personal server.
+- A terminal gets the server's environment. The launcher must read and
+  unlink its private hand-off before applying it. Rex's own `REX_SESSION`
+  and `REX_BLOCK` identify the created block even if a start unsets them
+  in the program environment.
 - In the API, `"shell":"none"` alone still runs under a login shell. Pass
   `"login":false` as well.
 - A block cannot be respawned. A restart is a new block with a new id.
 - Without `"exit":{"on_completion":false}` a block closes when its program
   exits and its exit status is lost.
-- `rex send` types raw bytes and never brackets a paste. A trailing `\n` is
-  not Enter; send the `enter` key. One call carries about 64,000 bytes, and a
-  refused call delivers nothing.
+- Use `block.event` with `type=paste` for paste semantics, and `send-key
+  enter` to submit. Rev 18 preserved 102,414 UTF-8 bytes, including an
+  embedded newline, across five independently bracketed paste events in a
+  raw tty. Do not infer application acceptance from an RPC acknowledgement.
 - `rex capture` always returns the whole scrollback. There is no tail option,
   and its cost grows with scrollback size.
-- Rex has no per-block metadata store and no last-output timestamp. The pack
-  keeps both itself.
-- Program status records have no run id and no exited flag. Rex drops a
-  `working` record when the foreground program exits and keeps `idle` and
-  `done` records with a dead `owner.pid`. Compare `owner.pid` with the
-  block's current process before trusting a record.
+- The app auto-subscribes to newly created sessions. A new background tab
+  reported `size.owner: null` and `size.desired: []` even with an `app`
+  client in `session.list_clients`. Do not use the session client list by
+  itself as a viewing signal.
+- `rex do` needs `-s <id>` for block methods. Its Lua bridge drops JSON
+  nulls when round-tripping replies, including `process.last_exit: null`.
+  Use direct JSON calls for process/status reads that need this distinction.
+- OSC root records have no run id or exited flag. An immediate `exec`
+  preserved a root with the same PID and the old name `bash` while
+  `process` named `sleep`. Distinguish the initial shell hand-off from an
+  observed program-image change. Use `last_exit` for terminal exit, even
+  when Rex retains an `idle` record. The same-image `exec` case is invisible.
+- Rex supplies report `updated_at` timestamps but no last-output timestamp.
+  Capture changes supply a sampled lower-resolution activity signal.
 - Labels are not unique. Address blocks by full id; a label can be ambiguous.
-- Every command on a missing block or session exits 3.
-- Stopping or restarting the Rex server ends every program in every session.
+- Direct block calls on a missing block exit 3; socket failure is an
+  outage, not a missing block. `block.close` removed the test child that
+  ignored SIGHUP but left the empty Rex session. The API has no atomic
+  destroy-if-empty guard, so the pack closes exact blocks only.
+- Rex allocates IDs for create requests. Neither `session.create` nor
+  `session.new_window` takes an idempotency key. If the create reply is
+  lost, only a launcher receipt can recover the block ID; leave an
+  unresolved journal entry instead of adopting or deleting by label.
+
+## Host work and startup
+
+- `fs.host` only works for a same-user local server. Require a Unix socket;
+  never use a remote Rex host as a fallback. Gas City normally stages
+  overlays and executes host setup. The fallback start wire has no provider
+  overlay selectors, so reject raw `per-provider` layers rather than stage
+  another provider's files.
+- The fallback start wire carries `session_live`, but many such commands
+  drive a default tmux server. Do not execute them in this runtime.
+- Do not use `watch-startup` to hold a child open: gc cancels that op with
+  SIGKILL to the script, without the ordinary TERM grace period. Returning
+  exit 2 uses gc's capture fallback.
