@@ -31,9 +31,14 @@ and say how it was verified.
   output lists the declared capabilities.
 - `exec` and `provision` must exit 2 without reading stdin. The pack declares
   `carrier.ops`, never `proc.exec`, `proc.provision` or `input-fence`.
-- Under `carrier.ops` start is one op: `start` waits until the agent is ready
-  and types the first turn itself (the start config's `nudge`). gc does not
-  type it.
+- Under `carrier.ops`, gc's `finishStart` dismisses dialogs only after
+  `start` returns. On dialog or readiness timeout, leave the block running
+  and record `GC_STARTUP_DELIVERY_UNCONFIRMED`. At `1e27045d0` gc neither
+  consumes that key nor retries the withheld text. A footer, NBSP, or box
+  border does not invalidate a prompt; a numbered menu cursor does.
+- The exec wire has no argv prompt field. At `1e27045d0` prompt delivery
+  routes a named pack runtime's `arg` and `flag` prompts into its nudge
+  anyway. Direct `exec:` does not get the named-pack rule.
 - gc stores the ready prompt with `set-meta <name> GC_READY_PROMPT_PREFIX` and
   reads it back with `get-meta`. It must round-trip byte for byte, and `stop`
   must drop it.
@@ -42,6 +47,11 @@ and say how it was verified.
   that ignores it.
 - gc does not set the script's working directory, and `HOME` may be a city
   directory. Use absolute paths. Key per-city state by `GC_EXEC_CITY_PATH`.
+- Python 3.9 on macOS uses a per-process monotonic clock origin. Use wall
+  time for persisted sample ages and monotonic time only within one process.
+- The macOS system Python can create a relative `nonexistent/Library/Caches`
+  tree when `HOME=/nonexistent`. Use `-B` in Python fixture shebangs too;
+  the isolated runtime and launcher already use it.
 
 ## Rex pitfalls
 
@@ -52,18 +62,22 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
 - Set an explicit `REX_SERVER=unix:///...` from the password database, not
   `HOME`. With `REX_AUTOSTART=0`, `whoami` on a missing socket exited 4 on
   rev 18 without falling back to the personal server.
-- A terminal gets the server's environment. The launcher must read and
-  unlink its private hand-off before applying it. Rex's own `REX_SESSION`
-  and `REX_BLOCK` identify the created block even if a start unsets them
-  in the program environment.
+- Rex supplies the terminal environment. Use a FIFO for the launch
+  config so even a kill before create cannot leave credentials on disk.
+  The receipt uses `REX_SESSION` and `REX_BLOCK` before any overrides or
+  stripping. Reset Python's ignored SIGPIPE and file-size signals before
+  exec; a shell pipeline otherwise reports a broken pipe.
 - In the API, `"shell":"none"` alone still runs under a login shell. Pass
   `"login":false` as well.
 - A block cannot be respawned. A restart is a new block with a new id.
 - Without `"exit":{"on_completion":false}` a block closes when its program
   exits and its exit status is lost.
-- Use `block.event` with `type=paste` for paste semantics, and `send-key
-  enter` to submit. Rev 18 preserved 102,414 UTF-8 bytes, including an
-  embedded newline, across five independently bracketed paste events in a
+- Use `block.event` for paste and key presses. It bypasses the Lua binding
+  path (`client.key`); direct events produced CR, Ctrl-C, and Down in the
+  test receiver. Wait 500 ms after paste and recheck for dialogs before
+  Enter. Terminal mode 2004 is visible in `modes` and can establish readiness
+  once `input_mode` is noncanonical. Rev 18 preserved 102,414 UTF-8 bytes,
+  including an embedded newline, across five bracketed paste events in a
   raw tty. `rex send` to that kind of receiver sent LF as LF with no paste
   markers. It accepted 60,000 bytes and refused 65,536 without typing them.
   Do not infer application acceptance from an RPC acknowledgement.
@@ -83,16 +97,22 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   observed program-image change. Use `last_exit` for terminal exit, even
   when Rex retains an `idle` record. The same-image `exec` case is invisible.
 - Rex supplies report `updated_at` timestamps but no last-output timestamp.
-  Capture changes supply a sampled lower-resolution activity signal.
+  Sample capture changes separately so `program-status` and `is-attached`
+  never wait behind startup, paste debounce, or a capture.
 - Labels are not unique. Address blocks by full id; a label can be ambiguous.
 - Direct block calls on a missing block exit 3; socket failure is an
-  outage, not a missing block. `block.close` removed the test child that
-  ignored SIGHUP but left the empty Rex session. The API has no atomic
-  destroy-if-empty guard, so the pack closes exact blocks only.
-- Rex allocates IDs for create requests. Neither `session.create` nor
-  `session.new_window` takes an idempotency key. If the create reply is
-  lost, only a launcher receipt can recover the block ID; leave an
-  unresolved journal entry instead of adopting or deleting by label.
+  outage. `block.close` removed the test child that ignored SIGHUP. An
+  empty session remained with `server.status.exit_empty = false`, but a
+  stored session ID can vanish, even between probing and creating a tab.
+  The API has no atomic destroy-if-empty guard: close exact blocks only.
+- Verify both `server.status.instance_id` and the live block's child PID;
+  a restored layout can retain IDs while the program changes. The
+  replacement-process case is tested with a double, without a server restart.
+- Rex allocates IDs for create requests. Exit 1 can be a definite server
+  rejection or a lost reply. Use the structured rejection code, never
+  print the raw response. A pending create is absent to readers. Unlink
+  its pipe before releasing the name and use a late receipt to reap only
+  that block. Never adopt or delete by label.
 
 ## Host work and startup
 

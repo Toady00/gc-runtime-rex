@@ -22,13 +22,17 @@ with it. The pack never selects a session or focuses the app for you.
 
 ## Add it to a city
 
-Add the checkout to the city's `city.toml`. Merge these settings into any
-existing `[session]` and `[daemon]` tables:
+Import the checkout in the city root's `pack.toml`:
 
 ```toml
 [imports.rex]
 source = "/absolute/path/to/gc-runtime-rex"
+```
 
+Select the runtime in `city.toml`. Merge these settings into any existing
+`[session]` and `[daemon]` tables:
+
+```toml
 [session]
 provider = "rex"
 # Optional: read OSC 7501 without using it for idle decisions yet.
@@ -43,11 +47,30 @@ that your program reports OSC 7501 states correctly, `program_status = "on"`
 also lets eligible states inform idle decisions. An unrecognized or
 unattributable status is not an idle verdict.
 
-For a provider that needs its initial prompt typed into the terminal, use
-`prompt_mode = "none"` so Gas City puts it in the start nudge. Set
-`ready_prompt_prefix` to its actual prompt or set `ready_delay_ms` for a
-program without a reliable prompt or status. A prompt that needs startup
-interaction can time out before Gas City's post-start dialog handling runs.
+When the city selects the imported runtime by name (`provider = "rex"`),
+the tested Gas City build puts the startup prompt in the start nudge even
+if the program's prompt mode is `arg` or `flag`. RPP has no argv prompt
+field. If you use a direct `exec:` path or a build without that named-pack
+routing, set `prompt_mode = "none"` on every provider used with Rex that
+needs a startup prompt. The pack's `nudge-fallback` declaration separately
+opts into moving prompts that exceed Gas City's argv size limits to the
+nudge.
+
+Set `ready_prompt_prefix` for programs with a recognizable composer, or
+`ready_delay_ms` for programs without one. A prefix takes priority over a
+delay. Without either, Rex waits for attributed OSC `idle` or for the tty
+to stay noncanonical with bracketed paste enabled for at least 400 ms.
+For a plain screen with no readiness signal, startup waits at most 15 s
+unless you configured a delay. A delay has at most 60 s of probe time.
+Gas City's deadline can shorten either wait.
+
+If a dialog or menu is visible, or readiness cannot be confirmed, the tab
+stays open and the first turn is withheld. The runtime warns and puts the
+reason in `GC_STARTUP_DELIVERY_UNCONFIRMED`. Gas City can run its normal
+post-start dialog dismissal after the op returns. The tested version does
+not consume this metadata or replay that text. Check the composer and
+resend manually if needed. Startup fails and rolls back the block if the
+program exits before a required first turn can be delivered.
 
 ## Server and state
 
@@ -61,7 +84,9 @@ different local server or CLI, set these in the controller's environment:
 | --- | --- |
 | `GC_REX_SOCKET` | Absolute path to an existing Rex Unix socket owned by the runtime user. No named or remote hosts. |
 | `GC_REX_BIN` | Absolute path to the `rex` executable. The path may contain spaces. |
-| `GC_EXEC_STATE_DIR` | Absolute path to a private state root. Defaults to `~/.local/share/gc-runtime-rex`. Keep it consistent across processes serving the city. |
+| `GC_EXEC_STATE_DIR` | Absolute path to a state root owned by the runtime user. If pre-created, use mode `0700`. Defaults to `~/.local/share/gc-runtime-rex`. Keep it consistent across processes serving the city. |
+| `GC_REX_STRIP_ENV` | Set to `1` to strip all `REX_*` variables from the launched program, including ones added by session configuration. Off by default. |
+| `GC_REX_MACHINE_ID` | Fallback UUID if the controller cannot get a native machine ID. Set it once per machine and keep it stable. |
 
 With a managed supervisor, make these available to the supervisor itself
 through its environment configuration. Setting them only in the launched
@@ -70,31 +95,58 @@ city's Rex terminals before switching its socket; keep the old mapping until
 you have verified the original objects are gone. The pack refuses to use
 stored IDs with a different socket.
 
-The pack stores full Rex IDs and per-incarnation metadata in private files
-under the state root, keyed by host name and city path. The tab label is for
-display. The launcher reads session environment from a one-use mode-0600 file,
-unlinks it, applies the configured variables over the server's environment,
-and unsets keys whose value is empty. Put credentials in environment variables,
-not in the launch command. The command runs through `/bin/sh` without a login
-shell. An empty command opens an interactive `/bin/sh`.
+The pack stores full Rex IDs and per-incarnation metadata in private files,
+keyed by machine UUID and city path. The tab label is for display. The
+launcher receives its environment through a mode-0600 named pipe, unlinks
+it after reading, applies variables over the server's environment, and
+unsets keys whose value is empty. An interrupted hand-off cannot leave the
+config on disk. Put credentials in environment variables, not in the
+launch command. The command runs through `/bin/sh` without a login shell.
+An empty command opens an interactive `/bin/sh`.
 
-`stop` closes the exact tab's block and drops its metadata. Rex keeps the city
-session when its last tab closes. You can remove an empty city session in Rex;
-the pack creates a new one on the next start. The pack does not destroy a Rex
-session wholesale because it may now contain manually added tabs. A restart
-of a stopped or dead Gas City session always creates a new block. If Rex
-loses a create reply and supplies neither an ID nor a launcher receipt, the
-pack records the incomplete attempt and refuses to guess by label. Inspect
-that session in Rex before clearing an incomplete state record.
+By default, the program also inherits Rex's `REX_SERVER`, `REX_SESSION`,
+and `REX_BLOCK` variables when the server supplies them. If you have installed
+Rex integration or startup hooks for your programs, they may tell the program
+about the terminal and how to drive Rex. A process running as you may be able
+to use the local CLI to drive your other Rex sessions. `GC_REX_STRIP_ENV=1`
+removes the inherited variables; it is not a permission boundary.
+
+Access to protected macOS folders such as `~/Documents`, `~/Desktop`, and
+`~/Downloads` depends on the privacy grants of the app macOS considers
+responsible for Rex Server. A grant to Gas City or to the viewing app does
+not grant access to the process in the terminal. Rex's local
+`server.apple.privacy_status` method identifies the responsible executable.
+
+`stop` closes the exact tab's block and drops its metadata. Rex can leave
+the city session empty after the last tab closes. It can also disappear.
+The pack recreates a missing city session on demand. Remove unused empty
+city sessions in Rex if you reach its session limit. The pack will not
+destroy a session wholesale: another client could add a tab between the
+empty check and the destroy request. If Rex loses a window-create reply,
+the pack releases the name and can reclaim the block on the next start or
+stop if the launcher supplies a receipt. Without an ID it cannot identify
+the leftover window. No launch config can be recovered from an abandoned
+pipe.
+
+After a server restart, the pack will not drive a restored block with a
+new server instance or a replacement child PID. It creates a fresh block
+instead. Inspect and remove any restored tabs you no longer need. If you
+tested a pre-release version keyed by hostname, stop its sessions with
+that version before switching to this one.
 
 ## Limits
 
-- Nudges are pasted and submitted with one Enter. Large text is sent in
+- Nudges check for visible menus, known dialogs, and OSC `blocked` before
+  pasting and again after a 500 ms pause before Enter. An explicit
+  `send-keys` or `interrupt` bypasses the dialog guard. The check and send
+  are separate calls, and no screen matcher recognizes every dialog.
+- Large text is sent in
   UTF-8 chunks; with bracketed paste the program receives a paste group per
   chunk. Multiline or tabbed text requires bracketed paste. Canonical tty
   input is rejected for large messages rather than risking truncation.
-  A failed send after input may have gone in blocks further nudges in that
-  block until you inspect it and restart the session.
+  Literal ESC and other terminal controls are rejected. A definite first
+  paste rejection can be retried. After an ambiguous or partial paste,
+  inspect the composer and use `interrupt` or restart before retrying.
 - Rex acknowledges that it queued input, not that the program read it. This
   carrier has no fenced input or typed `input-outcome` support. Gas City
   refuses fenced requests. Open the tab in Rex for interactive access;
@@ -105,9 +157,14 @@ that session in Rex before clearing an incomplete state record.
   proves what is currently visible. An indeterminate read keeps the session
   awake. Check attachment on your client before enabling interactive sleep.
 - Rex exposes timestamps for OSC reports but no last-output timestamp.
-  Other activity is dated when the capture changes, so changes that are
-  overwritten or invisible between samples can be missed. Rex sends all
-  scrollback on capture, even when Gas City only needs the last 120 lines.
+  Other activity is sampled at most once every 2 seconds and dated when
+  the capture changes. Rex sends all scrollback on capture, even for a
+  120-line peek or dialog check, so the cost rises with scrollback.
+  Attachment and status reads do not wait for a capture or startup.
+- Rex CLI requests have a two-second timeout and the controller reaps timed
+  out groups. On an uncatchable controller kill, an already launched CLI
+  can survive briefly under its own timeout. An arbitrary setup command
+  has no such independent timer.
 - Rex can retain an OSC record after a process exits or replaces itself.
   The pack checks the current process against the record, reports terminal
   exit separately, and retires a report on an observed program image change.
