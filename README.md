@@ -98,6 +98,7 @@ different local server or CLI, set these in the controller's environment:
 | `GC_EXEC_STATE_DIR` | Absolute path to a state root owned by the runtime user. If pre-created, use mode `0700`. Defaults to `~/.local/share/gc-runtime-rex`. Keep it consistent across processes serving the city. |
 | `GC_REX_STRIP_ENV` | Set to `1` to strip all `REX_*` variables from the launched program, including ones added by session configuration. Off by default. |
 | `GC_REX_MACHINE_ID` | Fallback UUID if the controller cannot get a native machine ID. Set it once per machine and keep it stable. |
+| `GC_REX_EXITED_GRACE` | Whole seconds a tab stays after a listing first finds its program exited. Defaults to `300`, ten default patrols. `0` closes it on that listing, before Gas City can read its screen. Any other value that is not a whole number is ignored, with a note on stderr. |
 
 With a managed supervisor, make these available to the supervisor itself
 through its environment configuration. Setting them only in the launched
@@ -128,8 +129,26 @@ responsible for Rex Server. A grant to Gas City or to the viewing app does
 not grant access to the process in the terminal. Rex's local
 `server.apple.privacy_status` method identifies the responsible executable.
 
-`stop` closes the exact tab's block and drops its metadata. Rex can leave
-the city session empty after the last tab closes. It can also disappear.
+`stop` closes the exact tab's block and drops its metadata. Gas City sends
+it for a session it retires. When a program exits by itself, or you close
+its tab in Rex, the tested version's legacy reconciler closes its own record
+of the session without a `stop`, and never starts a pool worker's name
+again. So `list-running` also cleans up under its prefix. Gas City runs it
+on every patrol, and for `gc status` and `gc doctor`.
+
+A tab whose program exited stays for `GC_REX_EXITED_GRACE` seconds after a
+listing first finds it, then a later listing closes it and drops its
+metadata. Gas City reads a dead session's screen on the patrol that finds
+it dead, to tell a rate limit or a provider error from a crash. A status
+listing can start the wait before that patrol, so keep the grace longer
+than your longest patrol cycle. The tab's screen and exit status go when it
+closes. Metadata for a tab you closed yourself is dropped by the next
+listing, if the Rex server that created the tab is still the one running
+and still has the city session. A name that another operation holds
+is left for the next listing, and cleanup that fails or runs short of time
+never fails the listing. A tab restored by a restarted server is left
+alone, with its metadata. Rex can leave the city session empty after the
+last tab closes. It can also disappear.
 The pack recreates a missing city session on demand. Remove unused empty
 city sessions in Rex if you reach its session limit. The pack will not
 destroy a session wholesale: another client could add a tab between the

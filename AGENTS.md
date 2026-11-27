@@ -44,6 +44,18 @@ and say how it was verified.
 - gc stores the ready prompt with `set-meta <name> GC_READY_PROMPT_PREFIX` and
   reads it back with `get-meta`. It must round-trip byte for byte, and `stop`
   must drop it.
+- gc sends `stop` for a session it retires. When the program exits by
+  itself or its tab is closed in Rex, the legacy reconciler at `1e27045d0`
+  closes the session bead as `runtime-missing` with no `stop`. An unaliased
+  pool name embeds the bead ID, so no later `start` recycles the block. The
+  exec provider has no `IsDeadRuntimeSession`, so gc's corpse cleanup never
+  runs for it. `list-running` reclaims ended blocks and records for that
+  reason. Verified in a live city: a killed pool worker's bead closed with
+  no `kill` event.
+- The same reconciler peeks a dead session's screen on the tick that finds
+  it dead (`checkRateLimitStability`), and its listing runs earlier in that
+  tick. Do not close an exited block on the listing that first sees it.
+  gc discards a failed op's stdout, so cleanup must never fail a listing.
 - A canceled op gets SIGTERM to its process group and, 2 seconds later,
   SIGKILL to the script only. Exit promptly on SIGTERM and start no child
   that ignores it.
@@ -51,6 +63,13 @@ and say how it was verified.
   directory. Use absolute paths. Key per-city state by `GC_EXEC_CITY_PATH`.
 - Python 3.9 on macOS uses a per-process monotonic clock origin. Use wall
   time for persisted sample ages and monotonic time only within one process.
+- On macOS, `os.killpg` on a group whose leader has exited but is not yet
+  reaped raises `PermissionError`, not `ProcessLookupError`. `Budget.run`
+  suppresses only the latter, so a `rex` call that ends just as its time
+  limit arrives fails the op with `Operation not permitted`. Open at
+  `2bd3128`: one failure in 25 runs of
+  `test_plain_screen_timeout_withholds_turn_and_keeps_session` under load,
+  and a three-line script reproduces the error.
 - The macOS system Python can create a relative `nonexistent/Library/Caches`
   tree when `HOME=/nonexistent`. Use `-B` in Python fixture shebangs too;
   the isolated runtime and launcher already use it.
@@ -96,6 +115,10 @@ Use API revision 18 (`0.1.0-preview.21` on macOS) as the tested baseline.
   client in `session.list_clients`. Do not use the session client list by
   itself as a viewing signal. A `rex new` terminal had no owner after the
   CLI exited on rev 18; the stale CLI owner seen on rev 11 did not recur.
+- Inside `rex do -s <live session>`, a missing block is a Lua error ending
+  in `code=not_found)` and the CLI exits 0. A missing session exits 3 before
+  the script runs, as do direct `api call`s on a missing block or session.
+  Seen on rev 18.
 - `rex do` needs `-s <id>` for block methods. Its Lua bridge drops JSON
   nulls and turns empty arrays into objects. The batched read uses an
   explicit sentinel for `last_exit: null` after validating the child PID;
