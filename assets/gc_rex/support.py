@@ -40,6 +40,17 @@ class Deadline(Failure):
     """The local budget expired before dispatch."""
 
 
+class Missing(Absent):
+    """The server that issued the ID no longer has the object."""
+
+
+class Busy(Failure):
+    """Another operation holds the name."""
+
+    def __init__(self):
+        super().__init__("session already exists (operation in progress)", 73)
+
+
 class Budget:
     def __init__(self, seconds):
         ms = os.environ.get("GC_EXEC_DEADLINE_MS")
@@ -192,7 +203,7 @@ class Store:
                     break
                 except BlockingIOError:
                     if collision:
-                        raise Failure("session already exists (operation in progress)", 73) from None
+                        raise Busy() from None
                     time.sleep(min(0.02, self.budget.remaining()))
             yield
         finally:

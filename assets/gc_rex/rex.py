@@ -8,7 +8,7 @@ import stat
 import sys
 import uuid
 
-from .support import Absent, Failure, Unconfirmed
+from .support import Absent, Failure, Missing, Unconfirmed
 
 
 # Batched reads use one attached connection. Never cache the server instance
@@ -24,8 +24,9 @@ local function read(method)
 end
 local function failed(method, err)
     -- Rex reports missing blocks/sessions as typed errors in this string.
+    -- The instance matched above, so the server that issued the ID has lost it.
     if err and (err:match(" code=not_found%)$") or err:match(" code=session_not_found%)$")) then
-        return {gone=true}
+        return {gone=true, missing=true}
     end
     return {error=method}
 end
@@ -127,7 +128,7 @@ class Rex:
         reply = json.loads(self.cli("do", "-s", target["session_id"], "--json", "-e", INSPECT,
                                     "--args", "-", data=encode(args)))
         if reply.get("gone") is True:
-            raise Absent()
+            raise Missing() if reply.get("missing") is True else Absent()
         if "error" in reply:
             detail = reply["error"]
             if detail not in {"server.status", "process", "child PID", *methods}:

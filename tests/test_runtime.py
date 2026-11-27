@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ OP = ASSETS / "gc-runtime-rex"
 sys.path.insert(0, str(ASSETS))
 from gc_rex import terminal
 from gc_rex.machine import machine_id
-from gc_rex.runtime import ARITY, ORPHAN_GRACE, STARTUP_NOTE, check_launch_pipe
+from gc_rex.runtime import ARITY, EXITED_GRACE, ORPHAN_GRACE, STARTUP_NOTE, check_launch_pipe
 from gc_rex.support import Budget, Failure, Store, digest
 
 
@@ -155,6 +156,233 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("paste", self.block())
         self.start()
         self.assertNotIn(original, self.backend()["blocks"])
+
+    def row_for(self, name):
+        return self.state_dir() / (digest(name) + ".json")
+
+    def row(self, name):
+        return json.loads(self.row_for(name).read_text())
+
+    def exit_block(self, name, **last_exit):
+        blocks = self.backend()["blocks"]
+        blocks[self.row(name)["block_id"]]["exit"] = last_exit or {"exit_code": -1, "error": "signal: killed"}
+        self.patch_backend(blocks=blocks)
+
+    def outlast_grace(self, name):
+        row = self.row(name)
+        row["exited"] -= EXITED_GRACE + 1
+        self.row_for(name).write_text(json.dumps(row))
+
+    def calls(self):
+        return [json.loads(line)[0] for line in (self.root / "calls").read_text().splitlines()]
+
+    def test_listing_closes_a_block_whose_program_exited(self):
+        # gc closes the bead of a session whose program exited by itself
+        # without sending stop, and a pool name is never started again.
+        self.start("gone", env={"GC_SESSION_ID": "test-id"})
+        self.start("live")
+        gone, live = self.row("gone"), self.row("live")
+        self.op("program-status", "gone")
+        self.op("get-last-activity", "gone")
+        sidecars = [self.state_dir() / (gone["launch"] + suffix) for suffix in (".status", ".activity")]
+        self.assertTrue(sidecars[1].exists())
+        self.exit_block("gone")
+
+        # A listing reads only the names under its prefix.
+        self.assertEqual(self.op("list-running", "live"), b"live\n")
+        self.assertNotIn("exited", self.row("gone"))
+
+        # gc reads the dead screen on the patrol that finds the program gone.
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertIn("exited", self.row("gone"))
+        self.assertEqual(self.op("peek", "gone", "1"), b"prompt> \n")
+        self.assertIn(b'"exited":true', self.op("program-status", "gone"))
+        before = len(self.calls())
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertEqual(len(self.calls()) - before, 2)  # One read per row while it waits.
+        self.assertIn(gone["block_id"], self.backend()["blocks"])
+        self.outlast_grace("gone")
+
+        # A cleanup that fails or is not confirmed costs the listing nothing
+        # and keeps the record for the next one.
+        for fault in ({"lose_close_reply": True}, {"method_error": {"server.status": 4}}):
+            with self.subTest(fault=fault):
+                self.patch_backend(**fault)
+                self.assertEqual(self.op("list-running", ""), b"live\n")
+                self.assertTrue(self.row_for("gone").exists())
+                self.assertIn(gone["block_id"], self.backend()["blocks"])
+                self.patch_backend(**dict.fromkeys(fault))
+
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertEqual(list(self.backend()["blocks"]), [live["block_id"]])
+        self.assertFalse(self.row_for("gone").exists())
+        self.assertFalse(any(path.exists() for path in sidecars))
+        self.assertEqual(self.op("is-running", "gone"), b"false\n")
+        self.assertEqual(self.op("get-meta", "gone", "GC_SESSION_ID"), b"")
+        self.op("program-status", "gone", code=66)
+        self.assertEqual(self.op("is-running", "live"), b"true\n")
+        self.start("gone")
+        self.assertEqual(self.op("list-running", ""), b"gone\nlive\n")
+
+    def two_exited(self):
+        """Two exited names past their grace, in the order a listing cleans them up."""
+        names = sorted(("one", "two"), key=digest)
+        for name in names:
+            self.start(name)
+            self.exit_block(name, exit_code=0)
+        self.env = dict(self.env, GC_REX_EXITED_GRACE="0")
+        return names
+
+    def test_listing_does_not_wait_for_a_name_another_op_holds(self):
+        held, free = self.two_exited()
+        lock = os.open(self.state_dir() / ("name-" + digest(held) + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.op("list-running", ""), b"")
+        finally:
+            os.close(lock)
+        # Waiting on the first name would have used the time for the second.
+        self.assertFalse(self.row_for(free).exists())
+        self.assertEqual(list(self.backend()["blocks"]), [self.row(held)["block_id"]])
+        self.assertEqual(self.op("list-running", ""), b"")
+        self.assertEqual(self.backend()["blocks"], {})
+
+    def test_listing_cleanup_stops_before_the_deadline(self):
+        names = self.two_exited()
+        self.start("live")
+        self.patch_backend(close_delay=5)
+        env = self.env
+        self.env = dict(env, GC_EXEC_DEADLINE_MS="3000")
+        # gc discards the names of a listing that fails.
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.env = env
+        self.assertTrue(all(self.row_for(name).exists() for name in names))
+        self.assertEqual(len(self.backend()["blocks"]), 3)
+        self.patch_backend(close_delay=0)
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertEqual(list(self.backend()["blocks"]), [self.row("live")["block_id"]])
+
+    def test_exited_grace_setting_and_clock(self):
+        self.start()
+        self.start("live")
+        self.exit_block("box")
+        # A setting that cannot be read falls back to waiting. It never fails the listing.
+        self.env = dict(self.env, GC_REX_EXITED_GRACE="soon")
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertEqual(len(self.backend()["blocks"]), 2)
+        first = self.row("box")["exited"]
+        self.assertLessEqual(first, time.time())
+        # A stamp from a clock that has since stepped back starts the wait again.
+        self.row_for("box").write_text(json.dumps(dict(self.row("box"), exited=time.time() + 3600)))
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertLessEqual(self.row("box")["exited"], time.time())
+        self.assertEqual(len(self.backend()["blocks"]), 2)
+        self.env = dict(self.env, GC_REX_EXITED_GRACE="0")
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertEqual(list(self.backend()["blocks"]), [self.row("live")["block_id"]])
+        self.assertFalse(self.row_for("box").exists())
+
+    def test_listing_drops_a_waiting_record_once_its_tab_is_closed_in_rex(self):
+        self.start()
+        self.exit_block("box")
+        self.assertEqual(self.op("list-running", ""), b"")
+        self.assertIn("exited", self.row("box"))
+        self.patch_backend(blocks={})
+        self.assertEqual(self.op("list-running", ""), b"")
+        self.assertFalse(self.row_for("box").exists())
+
+    def test_listing_drops_the_record_of_a_tab_closed_in_rex(self):
+        self.start("gone", env={"GC_SESSION_ID": "test-id"})
+        self.start("live")
+        gone, live = self.row("gone"), self.row("live")
+        self.op("get-last-activity", "gone")
+        activity = self.state_dir() / (gone["launch"] + ".activity")
+        self.assertTrue(activity.exists())
+        blocks = self.backend()["blocks"]
+        del blocks[gone["block_id"]]
+        self.patch_backend(blocks=blocks)
+        self.assertEqual(self.op("list-running", ""), b"live\n")
+        self.assertFalse(self.row_for("gone").exists())
+        self.assertFalse(activity.exists())
+        self.assertEqual(list(self.backend()["blocks"]), [live["block_id"]])
+        self.assertTrue(self.row_for("live").exists())
+        self.assertFalse(any(call[:3] == ["api", "call", "block.close"] for call in self.calls()))
+
+    def test_listing_leaves_a_block_it_cannot_prove_ended(self):
+        other = "00000000-0000-0000-0000-000000000002"
+
+        def unfinished(row):
+            data = json.loads(row.read_text())
+            for field in ("pid", "meta"):
+                data.pop(field)
+            row.write_text(json.dumps(data))
+            self.patch_backend(blocks={})
+
+        cases = {
+            "exited under another server": lambda row: (self.patch_block(exit={"exit_code": 0}),
+                                                        self.patch_backend(instance_id=other)),
+            "absent under another server": lambda row: self.patch_backend(blocks={}, instance_id=other),
+            "city session gone": lambda row: self.patch_backend(blocks={}, session_id="session:" + str(uuid.uuid4())),
+            "replaced child": lambda row: self.patch_block(pid=202),
+            "absent before the launch finished": unfinished,
+            "server outage": lambda row: self.patch_backend(error=4),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                for name in ("backend.json", "calls"):
+                    (self.root / name).unlink(missing_ok=True)
+                self.env = dict(self.env, GC_EXEC_STATE_DIR=str(self.root / case), GC_REX_EXITED_GRACE="0")
+                self.start()
+                blocks = self.backend()["blocks"]
+                row = next(p for p in (self.root / case).glob("*/*.json") if p.name != "city.json")
+                change(row)
+                before = len(self.calls())
+                self.op("list-running", "", code=1 if case == "server outage" else 0)
+                # It costs what it did before: at most the one read that could not judge it.
+                self.assertLessEqual(len(self.calls()) - before, 1)
+                self.patch_backend(error=0)
+                self.assertTrue(row.exists())
+                if "absent" not in case and "gone" not in case:
+                    self.assertEqual(self.backend()["blocks"].keys(), blocks.keys())
+
+    def test_listing_keeps_the_record_when_the_server_restarts_before_the_close(self):
+        self.start()
+        block = self.row("box")["block_id"]
+        self.exit_block("box", exit_code=0)
+        self.env = dict(self.env, GC_REX_EXITED_GRACE="0")
+        # The listing and the cleanup each read the exited block, then the server changes.
+        self.patch_backend(restart_after_do=2)
+        self.assertEqual(self.op("list-running", ""), b"")
+        self.assertNotEqual(self.backend()["instance_id"], "00000000-0000-0000-0000-000000000001")
+        self.assertIn(block, self.backend()["blocks"])
+        self.assertEqual(self.row("box")["block_id"], block)
+
+    def test_listing_cleanup_decides_on_the_record_under_the_lock(self):
+        self.start()
+        old = self.row("box")
+        self.exit_block("box", exit_code=0)
+        self.env = dict(self.env, GC_REX_EXITED_GRACE="0")
+        self.patch_backend(do_gate=True)
+        listing = subprocess.Popen([str(OP), "list-running", ""], env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.reap, listing)
+        until = time.monotonic() + 8
+        while not (self.root / "do_entered").exists():
+            self.assertLess(time.monotonic(), until)
+            time.sleep(0.01)
+        # The name is started again while the listing still holds the old record.
+        blocks = self.backend()["blocks"]
+        replacement = "block:" + str(uuid.uuid4())
+        blocks[replacement] = {}
+        self.patch_backend(blocks=blocks, do_gate=False)
+        self.row_for("box").write_text(json.dumps(dict(old, block_id=replacement, launch=uuid.uuid4().hex)))
+        (self.root / "do_release").touch()
+        self.assertEqual(listing.communicate(timeout=8)[0], b"")
+        self.assertEqual(listing.returncode, 0)
+        self.assertEqual(self.row("box")["block_id"], replacement)
+        # The record no longer names the old block, so nothing here may close it.
+        self.assertEqual(set(self.backend()["blocks"]), {old["block_id"], replacement})
+        self.assertEqual(self.op("list-running", ""), b"box\n")
 
     def test_process_status_roots_and_incarnations(self):
         def read():

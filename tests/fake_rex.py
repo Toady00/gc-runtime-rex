@@ -93,7 +93,23 @@ def main():
     block = args.get("block_id")
     if method in ("capture", "send-key"):
         block = argv[argv.index("-b") + 1]
-    if block and block not in state["blocks"]:
+    if method == "block.close" and state.get("close_delay"):
+        time.sleep(state["close_delay"])
+    if (state.get("method_error") or {}).get(method):
+        return state["method_error"][method]
+    if method == "do" and state.get("do_gate"):
+        # Hold the caller's first read until the test has changed its state.
+        (root / "do_entered").touch()
+        until = time.monotonic() + 20
+        while not (root / "do_release").exists():
+            if time.monotonic() > until:
+                return 1  # Never answer from the state read before the gate.
+            time.sleep(0.01)
+    # A script attached to a live session reads a typed error for a block
+    # that is gone. Everything else, including a missing session, exits 3.
+    if method == "do" and args["session_id"] != state.get("session_id"):
+        return 3
+    if block and block not in state["blocks"] and method != "do":
         return 3
     live = state["blocks"].get(block)
     result = {}
@@ -103,6 +119,8 @@ def main():
         assert argv[1:4] == ["-s", args["session_id"], "--json"]
         if args["instance"] != instance:
             result = {"gone": True}
+        elif live is None:
+            result = {"gone": True, "missing": True}
         else:
             process = block_read(live, "process")
             if process["last_exit"] is None:
@@ -113,6 +131,12 @@ def main():
             result = {"instance_id": instance, "process": process}
             for field in args["methods"]:
                 result[field] = {k: ({} if v == [] else v) for k, v in block_read(live, field).items() if v is not None}
+        if state.get("restart_after_do"):
+            # The server restarts after this read and restores the layout.
+            state["restart_after_do"] -= 1
+            if not state["restart_after_do"]:
+                state["instance_id"] = "00000000-0000-0000-0000-000000000009"
+            dirty = True
     elif method == "server.status":
         result = {"instance_id": instance}
     elif method == "session.list":
@@ -158,6 +182,9 @@ def main():
         dirty = True
         result = {"block_ids": [block], "window_id": f"window:{uuid.uuid4()}"}
     elif method == "block.close":
+        if state.get("lose_close_reply"):
+            print("unexpected EOF", file=sys.stderr)
+            return 1
         del state["blocks"][block]
         if state.get("auto_empty") and not state["blocks"]:
             state.pop("session_id", None)

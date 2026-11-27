@@ -16,7 +16,8 @@ import uuid
 from . import staging, terminal
 from .launch import PIPE_WAIT
 from .rex import Rejected, Rex, encode, object_id
-from .support import Absent, Budget, Cancelled, Deadline, Failure, Store, Unconfirmed, atomic_json, read_json
+from .support import (Absent, Budget, Busy, Cancelled, Deadline, Failure, Missing, Store, Unconfirmed,
+                      atomic_json, read_json)
 
 
 IDENTITY = ("GC_SESSION_ID", "GC_RUNTIME_EPOCH", "GC_INSTANCE_TOKEN", "GT_PROCESS_NAMES")
@@ -28,6 +29,12 @@ READY_SETTLE = 0.4
 # A late launch can spend a CLI timeout in flight, then wait for the pipe.
 ORPHAN_GRACE = PIPE_WAIT + 3
 ACTIVITY_SAMPLE = 2.0
+# gc reads a dead session's screen on the patrol that finds it dead, to tell a
+# rate limit or a provider error from a crash. A status listing can start this
+# clock before a slow patrol does, so allow ten default patrols.
+EXITED_GRACE = 300
+# gc discards the names of a listing that fails, so cleanup stops this early.
+CLEANUP_RESERVE = 1.0
 ARITY = {
     **dict.fromkeys(("start", "stop", "is-running", "nudge", "interrupt", "clear-scrollback",
                      "get-last-activity", "is-attached", "program-status", "process-alive", "list-running"), 1),
@@ -81,6 +88,18 @@ def rfc3339(value):
 
 def target(row):
     return {kind + "_id": object_id(row[kind + "_id"], kind) for kind in ("session", "block")}
+
+
+def exited_grace():
+    raw = os.environ.get("GC_REX_EXITED_GRACE", "")
+    if not raw:
+        return EXITED_GRACE
+    if not (raw.isascii() and raw.isdigit()):
+        # A setting for cleanup must not cost gc its listing.
+        print("Rex runtime: GC_REX_EXITED_GRACE is not a whole number of seconds; using the default",
+              file=sys.stderr)
+        return EXITED_GRACE
+    return int(raw)
 
 
 def check_launch_pipe(fd):
@@ -159,14 +178,16 @@ class Runtime:
         self.delete_row(path, row)
 
     def close_block(self, row):
+        """Close the launch's own block. False means this call left it alone."""
         if self.rex.instance() != row["instance"]:
-            return  # A restored block is not our process, even if the ID survived.
+            return False  # A restored block is not our process, even if the ID survived.
         try:
             if row.get("pid") and self.direct_process(row) is None:
-                return
+                return False
             self.rex.api("block.close", **target(row))
         except Absent:
             pass
+        return True
 
     def reap_receipts(self):
         if not any(self.store.root.glob("*.orphan")):
@@ -518,17 +539,69 @@ class Runtime:
             return reading["activity"]
 
     def list_running(self, prefix):
-        names = []
+        grace = exited_grace()
+        names, ended = [], []
         for path in self.store.root.glob("*.json"):
             if path.name == "city.json":
                 continue
             row = self.read_row(path)
             if row and row["name"].startswith(prefix):
-                process = self.process(row)
-                if process is not None and terminal.alive(process):
+                fate = self.fate(row)
+                if fate == "running":
                     names.append(row["name"])
+                elif fate:
+                    ended.append((path, fate))
         for name in sorted(names):
             print(name)
+        try:
+            with self.budget.until(self.budget.end - CLEANUP_RESERVE):
+                for path, fate in sorted(ended):
+                    self.reclaim(path, grace, fate)
+        except Deadline:
+            pass  # The names are complete. A later listing continues the cleanup.
+
+    def fate(self, row):
+        """How a launched block reads: running, exited or missing. None when it cannot be judged."""
+        if not row.get("pid"):
+            return None  # A launch that never finished belongs to start, stop and the receipt reaper.
+        try:
+            process = self.rex.inspect(target(row), row["instance"], row["pid"])["process"]
+        except Missing:
+            return "missing"
+        except Absent:
+            return None  # Another server instance or a replaced child. stop will not close it either.
+        return "running" if terminal.alive(process) else "exited"
+
+    def reclaim(self, path, grace, found):
+        # gc sends stop for a session it retires. When the program exits by
+        # itself, or its tab is closed in Rex, gc closes its own record
+        # without one, and a pool name is never started again. No later op
+        # would close the kept block or drop this record.
+        try:
+            with self.store.lock(path.stem, collision=True):
+                # The listing read without the lock. Decide on what is here now.
+                row = self.read_row(path)
+                if not row:
+                    return
+                now, seen = time.time(), row.get("exited")
+                if found == "exited" and seen is not None and 0 <= now - seen < grace:
+                    return  # Still waiting. A tab closed in Rex meanwhile reads as missing and goes on.
+                fate = self.fate(row)
+                if fate == "exited":
+                    if seen is None or seen > now:
+                        row["exited"] = seen = now
+                        atomic_json(path, row)
+                    if now - seen < grace or not self.close_block(row):
+                        return
+                elif fate != "missing":
+                    return
+                self.delete_row(path, row)
+        except (Cancelled, Deadline):
+            raise
+        except Busy:
+            pass  # The op holding the name decides. A later listing looks again.
+        except (Failure, OSError, ValueError, KeyError):
+            print("Rex runtime: ended terminal cleanup not confirmed", file=sys.stderr)
 
     def dispatch(self, op, name, args):
         if op == "list-running":
